@@ -1,0 +1,121 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  APP_DIR: local-voice-ai-agent
+  DEPLOY_PATH: /opt/cocktail-party
+
+jobs:
+  # ==========================================================================
+  # Build & Test
+  # ==========================================================================
+  build:
+    name: Build & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate Python syntax
+        run: |
+          cd ${{ env.APP_DIR }}
+          python -m py_compile *.py
+
+      - name: Validate Docker Compose
+        run: |
+          cd ${{ env.APP_DIR }}
+          docker compose config --quiet
+
+  # ==========================================================================
+  # Deploy to Production
+  # ==========================================================================
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Create .env file
+        run: |
+          cd ${{ env.APP_DIR }}
+          cat > .env << EOF
+          IS_PROD=true
+          GRADIO_USERNAME=${{ secrets.GRADIO_USERNAME }}
+          GRADIO_PASSWORD=${{ secrets.GRADIO_PASSWORD }}
+          HF_TOKEN=${{ secrets.HF_TOKEN }}
+          OLLAMA_HOST=http://ollama:11434
+          OLLAMA_MODEL=gemma3:4b
+          GRADIO_SERVER_NAME=0.0.0.0
+          GRADIO_SERVER_PORT=7860
+          DOCKER_CONTAINER=true
+          BEHIND_PROXY=true
+          HTTP_TIMEOUT=30
+          EOF
+
+      - name: Deploy to VPS
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.venv' \
+            --exclude='.mypy_cache' \
+            ${{ env.APP_DIR }}/ \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ env.DEPLOY_PATH }}/
+
+      - name: Build and restart containers
+        run: |
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
+            cd /opt/cocktail-party
+
+            # Build new images
+            docker compose build --pull
+
+            # Restart services with zero downtime
+            docker compose up -d --force-recreate
+
+            # Cleanup old images
+            docker image prune -f
+
+            # Show status
+            docker compose ps
+          EOF
+
+      - name: Health check
+        run: |
+          sleep 30
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
+            cd /opt/cocktail-party
+
+            # Check if containers are running
+            if docker compose ps | grep -q "running"; then
+              echo "✅ Deployment successful!"
+              docker compose ps
+            else
+              echo "❌ Deployment failed!"
+              docker compose logs --tail=50
+              exit 1
+            fi
+          EOF

@@ -13,8 +13,17 @@ from utilities import extract_transcript, extract_last_replies, back_and_forth
 
 from llm_client import stream_llm_response, get_llm_response
 
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+# Production mode flag - controls security features
+IS_PROD = os.getenv("IS_PROD", "false").lower() == "true"
+
 # Docker mode detection - disables direct audio device access in containers
 DOCKER_MODE = os.getenv("DOCKER_CONTAINER", "").lower() == "true"
+
+# Behind proxy flag - when true, SSL is handled by reverse proxy (e.g., Nginx Proxy Manager)
+BEHIND_PROXY = os.getenv("BEHIND_PROXY", "false").lower() == "true"
 
 # Global stop event for the audio monitor thread
 audio_monitor_stop = threading.Event()
@@ -85,8 +94,12 @@ def on_output_device_change(device_str):
     logger.info(f"🔊 Output device changed to: {device_str}")
     return f"Output device set to: {device_str}"
 
+# =============================================================================
+# Logging Configuration
+# =============================================================================
 logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+# Use INFO level in production, DEBUG in development
+logger.add(sys.stderr, level="INFO" if IS_PROD else "DEBUG")
 conversation="""\nTranscript:\n """
 example_conversation=""" AI: Hello sir, how are you doing?
 User: Uhh good. 
@@ -117,7 +130,8 @@ def talk():
     elif is_back_and_forth:
         context = "\n".join(extract_last_replies(conversation, 6))
     else:
-        print("summary activated")
+        if not IS_PROD:
+            logger.debug("summary activated")
         context = summary + conversation
     
     # 1. Stream text from LLM as it's generated
@@ -173,17 +187,18 @@ def create_stream():
 # Flag to prevent multiple talk_direct calls
 ai_is_speaking = False
 
-def make_summary(): 
+def make_summary():
     global conversation, summary
-    summary= get_llm_response(summary+conversation, summarize=True)
-    print("summary generated is "+ summary)
+    summary = get_llm_response(summary+conversation, summarize=True)
+    if not IS_PROD:
+        logger.debug(f"summary generated is {summary}")
     conversation = "\n".join(extract_last_replies(conversation, 10))
 
 def audio_callback(indata, frames, time, status):
-    global someone_talking, last_voice_detected, strikes, full_send_it, ai_is_speaking, conversation, last_summary_time
     """Process each audio chunk as it arrives."""
-    if status:
-        print(f"Status: {status}")
+    global someone_talking, last_voice_detected, strikes, full_send_it, ai_is_speaking, conversation, last_summary_time
+    if status and not IS_PROD:
+        logger.debug(f"Audio status: {status}")
     
     audio_chunk = indata[:, 0]  # Get mono channel
     volume = np.sqrt(np.mean(audio_chunk**2))
@@ -239,14 +254,18 @@ def start_audio_monitor(device=None):
 
 
 def start_conversation_printer():
-    """Print the conversation every 5 seconds in a separate thread."""
+    """Print the conversation every 5 seconds in a separate thread (dev mode only)."""
+    if IS_PROD:
+        logger.info("Conversation printer disabled in production mode")
+        return None
+
     def printer_loop():
         while not audio_monitor_stop.is_set():
-            print("\n" + "="*50)
-            print("📝 CONVERSATION:")
-            print("="*50)
-            print(conversation)
-            print("="*50 + "\n")
+            logger.debug("\n" + "="*50)
+            logger.debug("CONVERSATION:")
+            logger.debug("="*50)
+            logger.debug(conversation)
+            logger.debug("="*50 + "\n")
             time_module.sleep(5)
 
     thread = threading.Thread(target=printer_loop, daemon=True)
@@ -295,6 +314,52 @@ def create_ui_with_settings(stream):
     return demo
 
 
+def get_auth_config():
+    """Get authentication configuration based on environment."""
+    if not IS_PROD:
+        logger.info("Development mode - authentication disabled")
+        return None
+
+    username = os.getenv("GRADIO_USERNAME", "admin")
+    password = os.getenv("GRADIO_PASSWORD")
+
+    if not password:
+        logger.error("GRADIO_PASSWORD is required in production mode!")
+        raise ValueError(
+            "GRADIO_PASSWORD environment variable must be set when IS_PROD=true. "
+            "Set IS_PROD=false for development or provide a password."
+        )
+
+    logger.info(f"Authentication enabled for user: {username}")
+    return (username, password)
+
+
+def get_ssl_config():
+    """Get SSL configuration based on environment."""
+    # When behind a proxy (e.g., Nginx Proxy Manager), the proxy handles SSL
+    if BEHIND_PROXY:
+        logger.info("Running behind proxy - SSL handled by reverse proxy")
+        return {}
+
+    ssl_certfile = os.getenv("GRADIO_SSL_CERTFILE")
+    ssl_keyfile = os.getenv("GRADIO_SSL_KEYFILE")
+
+    if ssl_certfile and ssl_keyfile and os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
+        logger.info(f"SSL enabled with certificate: {ssl_certfile}")
+        config = {
+            "ssl_certfile": ssl_certfile,
+            "ssl_keyfile": ssl_keyfile,
+        }
+        # Only disable SSL verification in development mode (for self-signed certs)
+        if not IS_PROD:
+            logger.warning("Development mode - SSL verification disabled (self-signed cert)")
+            config["ssl_verify"] = False
+        return config
+
+    logger.warning("No SSL certificates found - launching without HTTPS")
+    return {}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Local Voice Chat Advanced")
     parser.add_argument(
@@ -303,6 +368,12 @@ if __name__ == "__main__":
         help="Launch with FastRTC phone interface (get a temp phone number)",
     )
     args = parser.parse_args()
+
+    # Log environment mode
+    if IS_PROD:
+        logger.info("Starting in PRODUCTION mode")
+    else:
+        logger.info("Starting in DEVELOPMENT mode")
 
     # Start audio monitor and printer only when running locally (not in Docker)
     # In Docker, WebRTC handles all audio via browser - no direct device access needed
@@ -321,14 +392,21 @@ if __name__ == "__main__":
         else:
             logger.info("Launching with Gradio UI (with settings)...")
             custom_ui = create_ui_with_settings(stream)
-            # SSL configuration for HTTPS (required for microphone access)
-            ssl_certfile = os.getenv("GRADIO_SSL_CERTFILE")
-            ssl_keyfile = os.getenv("GRADIO_SSL_KEYFILE")
-            if ssl_certfile and ssl_keyfile and os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
-                logger.info(f"Launching with SSL: {ssl_certfile}")
-                custom_ui.launch(ssl_certfile=ssl_certfile, ssl_keyfile=ssl_keyfile, ssl_verify=False)
-            else:
-                custom_ui.launch()
+
+            # Build launch configuration
+            launch_config = {}
+
+            # Add authentication if in production mode
+            auth = get_auth_config()
+            if auth:
+                launch_config["auth"] = auth
+
+            # Add SSL configuration
+            ssl_config = get_ssl_config()
+            launch_config.update(ssl_config)
+
+            # Launch the UI
+            custom_ui.launch(**launch_config)
     finally:
         # Cleanup when done
         audio_monitor_stop.set()

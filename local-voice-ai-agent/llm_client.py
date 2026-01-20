@@ -9,8 +9,19 @@ import requests
 import json
 from loguru import logger
 
+# Production mode flag
+IS_PROD = os.getenv("IS_PROD", "false").lower() == "true"
+
+# HTTP request timeout (seconds)
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
 OLLAMA_URL = f"{OLLAMA_HOST}/api/chat"
+
+
+class LLMError(Exception):
+    """Custom exception for LLM-related errors."""
+    pass
 
 
 # ============================================================================
@@ -86,50 +97,96 @@ def stream_llm_response(transcript: str, system_prompt: str = COCKTAIL_PARTY_PRO
     """
     Streams text chunks from Ollama /api/chat with stream=true.
     Yields small pieces of text as they come.
-    
+
     Args:
         transcript: The conversation transcript to send to the LLM
         system_prompt: Optional custom system prompt (defaults to COCKTAIL_PARTY_PROMPT)
-    
+
     Yields:
         str: Text chunks as they arrive from the LLM
+
+    Raises:
+        LLMError: If there's an error communicating with the LLM service
     """
     payload = build_chat_payload(transcript, system_prompt=ALONE_PROMPT if alone else BACK_AND_FORTH_PROMPT if is_back_and_forth else system_prompt)
 
-    with requests.post(OLLAMA_URL, json=payload, stream=True) as r:
-        r.raise_for_status()
-        for line in r.iter_lines():
-            if not line:
-                continue
-            data = json.loads(line.decode("utf-8"))
-            chunk = ""
-            if "message" in data and "content" in data["message"]:
-                chunk = data["message"]["content"].replace("*", "")
-            elif "delta" in data:
-                chunk = data["delta"].replace("*", "")
+    try:
+        with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=HTTP_TIMEOUT) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse LLM response line: {e}")
+                    continue
 
-            if chunk:
-                yield chunk
+                chunk = ""
+                if isinstance(data, dict):
+                    if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
+                        chunk = data["message"]["content"].replace("*", "")
+                    elif "delta" in data:
+                        chunk = str(data["delta"]).replace("*", "")
+
+                if chunk:
+                    yield chunk
+    except requests.exceptions.Timeout:
+        logger.error("LLM request timed out")
+        raise LLMError("Request to LLM service timed out")
+    except requests.exceptions.ConnectionError:
+        logger.error("Failed to connect to LLM service")
+        raise LLMError("Failed to connect to LLM service")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"LLM service returned an error: {e.response.status_code}")
+        raise LLMError("LLM service returned an error")
 
 
 def get_llm_response(transcript: str, system_prompt: str = SUMMARY_PROMPT, summarize: bool = True) -> str:
     """
     Gets a complete (non-streaming) response from Ollama.
-    
+
     Args:
         transcript: The conversation transcript to send to the LLM
         system_prompt: Optional custom system prompt
-    
+
     Returns:
         str: The complete response text
+
+    Raises:
+        LLMError: If there's an error communicating with the LLM service
     """
     payload = build_chat_payload(transcript, system_prompt=system_prompt, stream=False)
-    print("payload is "+str(payload))
-    response = requests.post(OLLAMA_URL, json=payload)
-    response.raise_for_status()
-    data = response.json()
-    
-    if "message" in data and "content" in data["message"]:
+
+    # Only log payload in development mode
+    if not IS_PROD:
+        logger.debug(f"LLM payload: {payload}")
+
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+    except requests.exceptions.Timeout:
+        logger.error("LLM request timed out")
+        raise LLMError("Request to LLM service timed out")
+    except requests.exceptions.ConnectionError:
+        logger.error("Failed to connect to LLM service")
+        raise LLMError("Failed to connect to LLM service")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"LLM service returned an error: {e.response.status_code}")
+        raise LLMError("LLM service returned an error")
+
+    try:
+        data = response.json()
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse LLM response: {e}")
+        raise LLMError("Invalid response from LLM service")
+
+    # Validate response structure
+    if not isinstance(data, dict):
+        logger.error("LLM response is not a valid JSON object")
+        raise LLMError("Invalid response format from LLM service")
+
+    if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
         return data["message"]["content"].replace("*", "")
     return ""
 
@@ -142,15 +199,18 @@ def stream_custom_chat(
 ):
     """
     Stream a custom chat with full control over parameters.
-    
+
     Args:
         user_content: The user message content
         system_prompt: The system prompt to use
         model: The Ollama model to use
         num_predict: Max tokens to generate
-    
+
     Yields:
         str: Text chunks as they arrive
+
+    Raises:
+        LLMError: If there's an error communicating with the LLM service
     """
     payload = build_chat_payload(
         user_content,
@@ -160,18 +220,34 @@ def stream_custom_chat(
         stream=True,
     )
 
-    with requests.post(OLLAMA_URL, json=payload, stream=True) as r:
-        r.raise_for_status()
-        for line in r.iter_lines():
-            if not line:
-                continue
-            data = json.loads(line.decode("utf-8"))
-            chunk = ""
-            if "message" in data and "content" in data["message"]:
-                chunk = data["message"]["content"].replace("*", "")
-            elif "delta" in data:
-                chunk = data["delta"].replace("*", "")
+    try:
+        with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=HTTP_TIMEOUT) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse LLM response line: {e}")
+                    continue
 
-            if chunk:
-                yield chunk
+                chunk = ""
+                if isinstance(data, dict):
+                    if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
+                        chunk = data["message"]["content"].replace("*", "")
+                    elif "delta" in data:
+                        chunk = str(data["delta"]).replace("*", "")
+
+                if chunk:
+                    yield chunk
+    except requests.exceptions.Timeout:
+        logger.error("LLM request timed out")
+        raise LLMError("Request to LLM service timed out")
+    except requests.exceptions.ConnectionError:
+        logger.error("Failed to connect to LLM service")
+        raise LLMError("Failed to connect to LLM service")
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"LLM service returned an error: {e.response.status_code}")
+        raise LLMError("LLM service returned an error")
 

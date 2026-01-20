@@ -2,11 +2,14 @@ services:
   # ============================================================================
   # Ollama - Local LLM Server
   # ============================================================================
+  # SECURITY: Ollama is internal-only. No ports are exposed to the host.
+  # The voice-app communicates with Ollama via Docker internal network.
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
-    ports:
-      - "11434:11434"
+    # REMOVED: Port exposure for security - Ollama should only be accessible internally
+    # ports:
+    #   - "11434:11434"
     volumes:
       - ollama_models:/root/.ollama
     healthcheck:
@@ -16,6 +19,13 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 5G
+        reservations:
+          memory: 2G
 
   # ============================================================================
   # Ollama Model Puller - One-time model download
@@ -37,13 +47,17 @@ services:
   # ============================================================================
   # Voice AI Application - Production
   # ============================================================================
+  # SECURITY: When using Nginx Proxy Manager (NPM), bind to localhost only.
+  # NPM handles SSL termination and proxies requests to this container.
   voice-app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: voice-app
     ports:
-      - "7860:7860"
+      # Bind to localhost only when behind reverse proxy (NPM)
+      # Change to "7860:7860" if direct access is needed (not recommended for production)
+      - "127.0.0.1:7860:7860"
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
@@ -51,7 +65,16 @@ services:
       - DOCKER_CONTAINER=true
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7860
-      # SSL configuration for HTTPS (required for microphone access)
+      # Production mode - enables authentication and security features
+      - IS_PROD=${IS_PROD:-true}
+      # Authentication credentials (required when IS_PROD=true)
+      - GRADIO_USERNAME=${GRADIO_USERNAME:-admin}
+      - GRADIO_PASSWORD=${GRADIO_PASSWORD:-}
+      # Set to true when behind Nginx Proxy Manager (SSL handled by proxy)
+      - BEHIND_PROXY=${BEHIND_PROXY:-false}
+      # HTTP request timeout for LLM calls
+      - HTTP_TIMEOUT=${HTTP_TIMEOUT:-30}
+      # SSL configuration for HTTPS (required for microphone access when not behind proxy)
       - GRADIO_SSL_CERTFILE=/app/certs/cert.pem
       - GRADIO_SSL_KEYFILE=/app/certs/key.pem
     volumes:
@@ -68,16 +91,25 @@ services:
       retries: 3
       start_period: 120s
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          memory: 2G
 
   # ============================================================================
   # Voice AI Application - Development (with source mounting)
   # ============================================================================
+  # Development mode: IS_PROD=false disables authentication and enables debug logging
   voice-app-dev:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: voice-app-dev
     ports:
+      # Open to all interfaces in development for easier testing
       - "7860:7860"
     environment:
       - OLLAMA_HOST=http://ollama:11434
@@ -86,6 +118,10 @@ services:
       - DOCKER_CONTAINER=true
       - GRADIO_SERVER_NAME=0.0.0.0
       - GRADIO_SERVER_PORT=7860
+      # Development mode - disables authentication, enables debug logging
+      - IS_PROD=false
+      - BEHIND_PROXY=false
+      - HTTP_TIMEOUT=30
       # SSL configuration for HTTPS (required for microphone access)
       - GRADIO_SSL_CERTFILE=/app/certs/cert.pem
       - GRADIO_SSL_KEYFILE=/app/certs/key.pem
@@ -93,11 +129,17 @@ services:
       - .:/app:ro
       - hf_cache:/home/voiceai/.cache/huggingface
       - kokoro_cache:/home/voiceai/.cache/kokoro
+      - ./certs:/app/certs:ro
     depends_on:
       ollama:
         condition: service_healthy
     profiles:
       - dev
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
 
 volumes:
   ollama_models:
