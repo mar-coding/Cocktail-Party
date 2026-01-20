@@ -3,7 +3,7 @@ import os
 import argparse
 import threading
 
-from fastrtc import ReplyOnPause, Stream, get_stt_model, get_tts_model
+from fastrtc import ReplyOnPause, Stream, get_stt_model, get_tts_model, get_hf_turn_credentials
 from loguru import logger
 import gradio as gr
 import numpy as np
@@ -180,8 +180,29 @@ def echo(audio):
     conversation+="\nUser:"+transcript
     yield from talk()
 
+def get_rtc_configuration():
+    """Get RTC configuration for WebRTC NAT traversal."""
+    hf_token = os.getenv("HF_TOKEN")
+
+    if hf_token:
+        try:
+            # HuggingFace's free TURN server (10GB/month)
+            return get_hf_turn_credentials(token=hf_token)
+        except Exception as e:
+            logger.warning(f"Failed to get HF TURN credentials: {e}, using STUN fallback")
+
+    # Fallback: Public STUN servers (limited NAT traversal)
+    return {
+        "iceServers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun1.l.google.com:19302"},
+        ]
+    }
+
+
 def create_stream():
-    return Stream(ReplyOnPause(echo), modality="audio", mode="send-receive")
+    rtc_config = get_rtc_configuration()
+    return Stream(ReplyOnPause(echo), modality="audio", mode="send-receive", rtc_configuration=rtc_config)
 
 
 # Flag to prevent multiple talk_direct calls

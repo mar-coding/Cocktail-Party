@@ -132,6 +132,7 @@ services:
       - GRADIO_SSL_KEYFILE=/app/certs/key.pem
     volumes:
       - .:/app:ro
+      - /app/.venv  # Preserve .venv from Docker build (don't overwrite with host)
       - hf_cache:/home/voiceai/.cache/huggingface
       - kokoro_cache:/home/voiceai/.cache/kokoro
       - ./certs:/app/certs:ro
