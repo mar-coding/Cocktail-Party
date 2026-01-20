@@ -19,6 +19,8 @@ services:
       retries: 5
       start_period: 30s
     restart: unless-stopped
+    networks:
+      - cocktail-party-network
     deploy:
       resources:
         limits:
@@ -54,10 +56,9 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: voice-app
-    ports:
-      # Bind to localhost only when behind reverse proxy (NPM)
-      # Change to "7860:7860" if direct access is needed (not recommended for production)
-      - "127.0.0.1:7860:7860"
+    # No ports exposed - NPM reaches via shared Docker network
+    expose:
+      - "7860"
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
@@ -85,12 +86,15 @@ services:
       ollama:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fk", "https://localhost:7860/"]
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 120s
     restart: unless-stopped
+    networks:
+      - cocktail-party-network
+      - web_proxy
     deploy:
       resources:
         limits:
@@ -103,6 +107,7 @@ services:
   # Voice AI Application - Development (with source mounting)
   # ============================================================================
   # Development mode: IS_PROD=false disables authentication and enables debug logging
+  # Usage: make dev (or docker compose --profile dev up -d)
   voice-app-dev:
     build:
       context: .
@@ -133,6 +138,14 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fk", "https://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    networks:
+      - cocktail-party-network
     profiles:
       - dev
     deploy:
@@ -148,3 +161,9 @@ volumes:
     name: voice_ai_hf_cache
   kokoro_cache:
     name: voice_ai_kokoro_cache
+
+networks:
+  cocktail-party-network:
+    driver: bridge
+  web_proxy:
+    external: true
