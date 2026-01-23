@@ -2,7 +2,13 @@
 # Voice AI Makefile - Simple deployment for local and production
 # =============================================================================
 
-.PHONY: help setup setup-model certs build up down restart logs shell clean dev prod status
+.PHONY: help setup setup-model certs build up down restart logs shell clean dev prod status network-setup
+
+# Ensure networks exist and clean stale containers
+network-setup:
+	@docker rm -f ollama-pull 2>/dev/null || true
+	@docker rm -f voice-app 2>/dev/null || true
+	@docker rm -f voice-app-dev 2>/dev/null || true
 
 # Default target
 help:
@@ -11,7 +17,7 @@ help:
 	@echo ""
 	@echo "Setup:"
 	@echo "  make setup        - Full setup: generate certs + pull model + build"
-	@echo "  make setup-model  - Pull the Ollama model only"
+	@echo "  make setup-model  - Pull the Ollama model (Docker Ollama only)"
 	@echo "  make certs        - Generate SSL certificates"
 	@echo "  make build        - Build Docker images"
 	@echo ""
@@ -34,20 +40,26 @@ help:
 	@echo "  make shell        - Open shell in voice-app container"
 	@echo "  make clean        - Remove containers and volumes"
 	@echo ""
-	@echo "Environment Variables:"
-	@echo "  OLLAMA_MODEL      - Model to use (default: gemma3:4b)"
-	@echo "  HF_TOKEN          - HuggingFace token for private models"
+	@echo "LLM Provider Options (set in .env):"
+	@echo "  LLM_PROVIDER=anthropic  - Use Anthropic Claude API (no Ollama needed)"
+	@echo "  LLM_PROVIDER=ollama     - Use Ollama (Docker or local Mac)"
+	@echo ""
+	@echo "  OLLAMA_HOST examples:"
+	@echo "    http://ollama:11434              - Docker Ollama container"
+	@echo "    http://host.docker.internal:11434 - Local Mac Ollama"
+	@echo "    http://YOUR_VPS_IP:11434         - Remote GPU server"
 
 # =============================================================================
 # Setup Commands
 # =============================================================================
 
-setup: certs build setup-model
+setup: network-setup certs build setup-model
 	@echo "Setup complete! Run 'make prod' or 'make dev' to start."
 
 setup-model:
 	@echo "Pulling Ollama model..."
-	docker compose --profile setup up ollama-pull
+	@docker rm -f ollama-pull 2>/dev/null || true
+	docker compose --profile ollama up ollama-pull
 
 certs:
 	@echo "Generating SSL certificates..."
@@ -68,7 +80,18 @@ build:
 
 dev: certs
 	@echo "Starting in development mode..."
-	docker compose --profile dev up -d ollama voice-app-dev
+	@LLM_PROVIDER=$$(grep -E "^LLM_PROVIDER=" .env 2>/dev/null | tail -1 | cut -d= -f2 || echo "ollama"); \
+	OLLAMA_HOST=$$(grep -E "^OLLAMA_HOST=" .env 2>/dev/null | tail -1 | cut -d= -f2 || echo "http://ollama:11434"); \
+	if [ "$$LLM_PROVIDER" = "anthropic" ]; then \
+		echo "Using Anthropic Claude API (no Ollama container needed)"; \
+		docker compose --profile dev up -d voice-app-dev; \
+	elif echo "$$OLLAMA_HOST" | grep -q "ollama:11434"; then \
+		echo "Using Docker Ollama container"; \
+		docker compose --profile dev --profile ollama up -d voice-app-dev; \
+	else \
+		echo "Using external Ollama at $$OLLAMA_HOST"; \
+		docker compose --profile dev up -d voice-app-dev; \
+	fi
 	@echo ""
 	@echo "Voice AI running at: https://localhost:7860"
 	@echo "Run 'make dev-logs' to view logs"
@@ -87,21 +110,63 @@ dev-restart: dev-down dev
 
 prod: certs
 	@echo "Starting in production mode..."
-	docker compose up -d ollama voice-app
-	@echo ""
-	@echo "Voice AI running at: https://localhost:7860"
+	@LLM_PROVIDER=$$(grep -E "^LLM_PROVIDER=" .env 2>/dev/null | tail -1 | cut -d= -f2 || echo "ollama"); \
+	OLLAMA_HOST=$$(grep -E "^OLLAMA_HOST=" .env 2>/dev/null | tail -1 | cut -d= -f2 || echo "http://ollama:11434"); \
+	NEED_OLLAMA="false"; \
+	if [ "$$LLM_PROVIDER" = "ollama" ] && echo "$$OLLAMA_HOST" | grep -q "ollama:11434"; then \
+		NEED_OLLAMA="true"; \
+	fi; \
+	if grep -q "^IS_PROD=true" .env 2>/dev/null; then \
+		echo "IS_PROD=true detected, using production config (no port mapping)..."; \
+		docker network create web_proxy 2>/dev/null || true; \
+		if [ "$$NEED_OLLAMA" = "true" ]; then \
+			echo "Using Docker Ollama container"; \
+			docker compose --profile ollama up -d voice-app; \
+		else \
+			echo "Using $$LLM_PROVIDER ($$OLLAMA_HOST)"; \
+			docker compose up -d voice-app; \
+		fi; \
+		docker network connect web_proxy voice-app 2>/dev/null || true; \
+		echo ""; \
+		echo "Voice AI running behind proxy on internal network"; \
+	else \
+		echo "IS_PROD=false detected, using local config (with port mapping)..."; \
+		if [ "$$NEED_OLLAMA" = "true" ]; then \
+			echo "Using Docker Ollama container"; \
+			docker compose --profile dev --profile ollama up -d voice-app-dev; \
+		else \
+			echo "Using $$LLM_PROVIDER ($$OLLAMA_HOST)"; \
+			docker compose --profile dev up -d voice-app-dev; \
+		fi; \
+		echo ""; \
+		echo "Voice AI running at: https://localhost:7860"; \
+	fi
 	@echo "Run 'make prod-logs' to view logs"
 
 prod-down:
-	docker compose down voice-app
+	@if grep -q "^IS_PROD=true" .env 2>/dev/null; then \
+		docker compose down voice-app; \
+	else \
+		docker compose --profile dev down voice-app-dev; \
+	fi
 
 prod-logs:
-	docker compose logs -f voice-app
+	@if grep -q "^IS_PROD=true" .env 2>/dev/null; then \
+		docker compose logs -f voice-app; \
+	else \
+		docker compose --profile dev logs -f voice-app-dev; \
+	fi
 
 prod-restart:
-	docker compose down voice-app
-	docker compose build voice-app
-	docker compose up -d voice-app
+	@if grep -q "^IS_PROD=true" .env 2>/dev/null; then \
+		docker compose down voice-app && \
+		docker compose build voice-app && \
+		docker compose up -d voice-app; \
+	else \
+		docker compose --profile dev down voice-app-dev && \
+		docker compose --profile dev build voice-app-dev && \
+		docker compose --profile dev up -d voice-app-dev; \
+	fi
 
 # =============================================================================
 # Common Commands
@@ -110,7 +175,7 @@ prod-restart:
 up: prod
 
 down:
-	docker compose --profile dev down
+	docker compose --profile dev --profile ollama down --remove-orphans
 
 restart: prod-restart
 
@@ -136,7 +201,7 @@ shell-ollama:
 
 clean:
 	@echo "Stopping and removing containers..."
-	docker compose --profile dev --profile setup down -v
+	docker compose --profile dev --profile ollama down -v
 	@echo "Removing certificates..."
 	rm -rf certs/
 	@echo "Clean complete."

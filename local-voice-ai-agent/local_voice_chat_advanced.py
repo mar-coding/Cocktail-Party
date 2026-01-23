@@ -3,15 +3,16 @@ import os
 import argparse
 import threading
 
-from fastrtc import ReplyOnPause, Stream, get_stt_model, get_tts_model, get_hf_turn_credentials
+from fastrtc import ReplyOnPause, Stream, get_stt_model, get_tts_model, get_hf_turn_credentials, AlgoOptions, SileroVadOptions
 from loguru import logger
 import gradio as gr
 import numpy as np
 import time as time_module  # rename to avoid conflict with callback's 'time' param
 import sounddevice as sd
-from utilities import extract_transcript, extract_last_replies, back_and_forth
+from utilities import extract_transcript, extract_last_replies, back_and_forth, calculate_response_delay
 
 from llm_client import stream_llm_response, get_llm_response
+from speaker_diarizer import identify_speaker, USE_DIARIZATION
 
 # =============================================================================
 # Environment Configuration
@@ -25,6 +26,24 @@ DOCKER_MODE = os.getenv("DOCKER_CONTAINER", "").lower() == "true"
 # Behind proxy flag - when true, SSL is handled by reverse proxy (e.g., Nginx Proxy Manager)
 BEHIND_PROXY = os.getenv("BEHIND_PROXY", "false").lower() == "true"
 
+# Maximum concurrent WebRTC connections (default: 6)
+MAX_CONCURRENT_CONNECTIONS = int(os.getenv("MAX_CONCURRENT_CONNECTIONS", "6"))
+
+# =============================================================================
+# Latency Optimization Configuration
+# =============================================================================
+FAST_ALGO_OPTIONS = AlgoOptions(
+    audio_chunk_duration=0.4,        # Reduced from 0.6s
+    started_talking_threshold=0.15,  # Reduced from 0.2s
+    speech_threshold=0.08            # Reduced from 0.1s
+)
+
+FAST_VAD_OPTIONS = SileroVadOptions(
+    threshold=0.5,
+    min_speech_duration_ms=200,
+    min_silence_duration_ms=800      # KEY: Reduced from 2000ms
+)
+
 # Global stop event for the audio monitor thread
 audio_monitor_stop = threading.Event()
 
@@ -35,6 +54,26 @@ if not DOCKER_MODE:
 
 stt_model = get_stt_model()  # moonshine/base
 tts_model = get_tts_model()  # kokoro
+
+def warmup_models():
+    """Warm up models to reduce first inference latency."""
+    logger.info("Warming up models...")
+    # Warm STT with silent audio
+    try:
+        stt_model.stt((16000, np.zeros(16000, dtype=np.float32)))
+    except Exception:
+        pass
+    # Warm TTS with short phrase
+    try:
+        for _ in tts_model.stream_tts_sync("Hi"):
+            break
+    except Exception:
+        pass
+    logger.info("Model warm-up complete")
+
+# Call warm-up in non-Docker mode or optionally in Docker
+if not DOCKER_MODE:
+    warmup_models()
 
 # Track the current selected input device (None means use default)
 selected_input_device = None
@@ -117,37 +156,60 @@ summary="\nSummary:\n"
 
 def talk():
     global conversation, someone_talking, last_voice_detected, summary
-    logger.debug("🧠 Starting to talk...")
+    logger.debug("Starting to talk...")
     text_buffer = ""
-    ai_reply="AI:"
+    ai_reply = "AI:"
     alone = all(r.startswith("AI:") for r in extract_last_replies(conversation, 2))
     is_back_and_forth = back_and_forth(conversation, 6)  # 3 back and forths
-    
+
     # Determine context to send
     if alone:
         context = "\n".join(extract_last_replies(conversation, 2))
-        #print("alone activated")
     elif is_back_and_forth:
         context = "\n".join(extract_last_replies(conversation, 6))
     else:
         if not IS_PROD:
             logger.debug("summary activated")
         context = summary + conversation
-    
+
+    # Track first chunk and timing for faster initial response
+    first_chunk = True
+    last_chunk_time = time_module.time()
+
     # 1. Stream text from LLM as it's generated
     for chunk in stream_llm_response(context, alone=alone, is_back_and_forth=is_back_and_forth):
         text_buffer += chunk
-        ai_reply+=chunk
+        ai_reply += chunk
         if someone_talking:
             break
-        # Simple heuristic: speak when we see end of sentence or buffer big enough
-        if any(p in text_buffer for p in [".", "!", "?"]) or (len(text_buffer) > 30 and text_buffer[-1]==","):
+
+        # More aggressive chunking for faster response
+        should_speak = False
+        time_since_chunk = time_module.time() - last_chunk_time
+
+        if first_chunk and len(text_buffer) >= 12:
+            # Start TTS early on first chunk
+            should_speak = True
+            first_chunk = False
+        elif any(p in text_buffer for p in [".", "!", "?"]):
+            should_speak = True
+        elif len(text_buffer) > 18 and text_buffer[-1] in [",", ";", ":", " "]:
+            should_speak = True
+        elif len(text_buffer) > 35:
+            # Force speak if buffer getting large
+            should_speak = True
+        elif time_since_chunk > 0.4 and len(text_buffer) > 8:
+            # Timeout fallback - don't wait forever
+            should_speak = True
+
+        if should_speak:
+            last_chunk_time = time_module.time()
             speak_part = text_buffer
             text_buffer = ""
             if someone_talking:
                 break
 
-            logger.debug(f"🗣️ TTS on chunk: {speak_part!r}")
+            logger.debug(f"TTS on chunk: {speak_part!r}")
             # 2. Stream TTS for that chunk
             for audio_chunk in tts_model.stream_tts_sync(speak_part):
                 if someone_talking:
@@ -160,13 +222,13 @@ def talk():
         return False
 
     if text_buffer:
-        ai_reply+=text_buffer
-        logger.debug(f"🗣️ TTS on final chunk: {text_buffer!r}")
+        ai_reply += text_buffer
+        logger.debug(f"TTS on final chunk: {text_buffer!r}")
         for audio_chunk in tts_model.stream_tts_sync(text_buffer):
             if someone_talking:
                 break
             yield audio_chunk
-    conversation+="\n"+ai_reply
+    conversation += "\n" + ai_reply
 
 
 
@@ -175,9 +237,29 @@ def echo(audio):
     if full_send_it:
         full_send_it = False
         yield from talk()
+        return
+
     transcript = stt_model.stt(audio)
-    logger.debug(f"🎤 Transcript: {transcript}")
-    conversation+="\nUser:"+transcript
+    logger.debug(f"Transcript: {transcript}")
+
+    if not transcript.strip():
+        return
+
+    # Identify speaker (non-blocking, 300ms timeout)
+    speaker_id = identify_speaker(audio) if USE_DIARIZATION else "User"
+
+    conversation += f"\n{speaker_id}:" + transcript
+
+    # Smart delay based on context
+    delay = calculate_response_delay(transcript, conversation)
+
+    if delay > 0:
+        logger.debug(f"Waiting {delay}s before responding")
+        time_module.sleep(delay)
+        if someone_talking:
+            logger.debug("Someone started talking, aborting response")
+            return
+
     yield from talk()
 
 def get_rtc_configuration():
@@ -202,7 +284,18 @@ def get_rtc_configuration():
 
 def create_stream():
     rtc_config = get_rtc_configuration()
-    return Stream(ReplyOnPause(echo), modality="audio", mode="send-receive", rtc_configuration=rtc_config)
+    return Stream(
+        ReplyOnPause(
+            echo,
+            algo_options=FAST_ALGO_OPTIONS,
+            model_options=FAST_VAD_OPTIONS,
+            can_interrupt=True
+        ),
+        modality="audio",
+        mode="send-receive",
+        rtc_configuration=rtc_config,
+        concurrency_limit=MAX_CONCURRENT_CONNECTIONS
+    )
 
 
 # Flag to prevent multiple talk_direct calls
@@ -249,13 +342,19 @@ def proactive_speak():
     try:
         logger.debug("🎙️ AI proactively speaking...")
         for audio_chunk in talk():
-            # FastRTC returns tuples as (sample_rate, audio_data)
-            sample_rate, audio_data = audio_chunk
-            # Convert to float32 for sounddevice and ensure 1D
-            audio_data = np.asarray(audio_data, dtype=np.float32).flatten()
-            if audio_data.size > 0:
-                sd.play(audio_data, samplerate=int(sample_rate), blocking=True)
+            try:
+                # FastRTC returns tuples as (sample_rate, audio_data)
+                sample_rate, audio_data = audio_chunk
+                # Convert to float32 for sounddevice and ensure 1D
+                audio_data = np.asarray(audio_data, dtype=np.float32).flatten()
+                if audio_data.size > 0:
+                    sd.play(audio_data, samplerate=int(sample_rate), blocking=True)
+            except Exception as e:
+                logger.warning(f"Audio playback error (transport may be closing): {e}")
+                break
         logger.debug("🎙️ Finished proactive speech")
+    except Exception as e:
+        logger.warning(f"Proactive speak error: {e}")
     finally:
         ai_is_speaking = False
         last_voice_detected = time_module.time()  # Reset timer after speaking
@@ -430,4 +529,22 @@ if __name__ == "__main__":
             custom_ui.launch(**launch_config)
     finally:
         # Cleanup when done
+        logger.info("Shutting down...")
         audio_monitor_stop.set()
+
+        # Close all WebRTC connections gracefully
+        try:
+            # Give time for threads to notice stop flag
+            time_module.sleep(0.5)
+
+            # Close stream connections if available
+            if hasattr(stream, 'connections'):
+                for conn_id in list(stream.connections.keys()):
+                    try:
+                        stream.connections[conn_id].close()
+                    except Exception as e:
+                        logger.debug(f"Error closing connection {conn_id}: {e}")
+        except Exception as e:
+            logger.warning(f"Error during stream cleanup: {e}")
+
+        logger.info("Cleanup complete")

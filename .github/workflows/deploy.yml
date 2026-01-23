@@ -25,7 +25,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Validate Python syntax
         run: |
@@ -65,14 +65,21 @@ jobs:
           GRADIO_USERNAME=${{ secrets.GRADIO_USERNAME }}
           GRADIO_PASSWORD=${{ secrets.GRADIO_PASSWORD }}
           HF_TOKEN=${{ secrets.HF_TOKEN }}
+          LLM_PROVIDER=${{ secrets.LLM_PROVIDER }}
+          ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL=claude-3-haiku-20240307
           OLLAMA_HOST=http://ollama:11434
           OLLAMA_MODEL=gemma3:4b
           GRADIO_SERVER_NAME=0.0.0.0
           GRADIO_SERVER_PORT=7860
           DOCKER_CONTAINER=true
           BEHIND_PROXY=true
-          HTTP_TIMEOUT=30
+          HTTP_CONNECT_TIMEOUT=10
+          HTTP_READ_TIMEOUT=120
+          MAX_CONCURRENT_CONNECTIONS=6
           EOF
+          # Remove leading whitespace from .env
+          sed -i 's/^[[:space:]]*//' .env
 
       - name: Deploy to VPS
         run: |
@@ -82,39 +89,61 @@ jobs:
             --exclude='*.pyc' \
             --exclude='.venv' \
             --exclude='.mypy_cache' \
+            --exclude='certs/*.pem' \
             ${{ env.APP_DIR }}/ \
             ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ env.DEPLOY_PATH }}/
 
       - name: Build and restart containers
         run: |
-          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'ENDSSH'
             cd /opt/cocktail-party
+
+            # Read LLM_PROVIDER from .env
+            LLM_PROVIDER=$(grep -E "^LLM_PROVIDER=" .env | tail -1 | cut -d= -f2)
+            echo "LLM Provider: $LLM_PROVIDER"
 
             # Build new images
             docker compose build --pull
 
-            # Start Ollama first
-            docker compose up -d ollama
+            if [ "$LLM_PROVIDER" = "ollama" ]; then
+              echo "Starting with Docker Ollama..."
 
-            # Wait for Ollama to be healthy
-            echo "Waiting for Ollama to be ready..."
-            sleep 10
+              # Get model name from .env
+              OLLAMA_MODEL=$(grep -E "^OLLAMA_MODEL=" .env | tail -1 | cut -d= -f2)
+              OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+              echo "Ollama Model: $OLLAMA_MODEL"
 
-            # Pull model if not exists
-            if ! docker exec ollama ollama list | grep -q "gemma3:4b"; then
-              echo "Pulling gemma3:4b model (this may take a few minutes)..."
-              docker exec ollama ollama pull gemma3:4b
+              # Start Ollama first
+              docker compose --profile ollama up -d ollama
+
+              # Wait for Ollama to be healthy
+              echo "Waiting for Ollama to be ready..."
+              sleep 15
+
+              # Pull model if not exists
+              if ! docker exec ollama ollama list | grep -q "$OLLAMA_MODEL"; then
+                echo "Pulling $OLLAMA_MODEL model (this may take a few minutes)..."
+                docker exec ollama ollama pull "$OLLAMA_MODEL"
+              fi
+
+              # Start voice-app with ollama profile
+              docker compose --profile ollama up -d voice-app
+            else
+              echo "Starting with Anthropic Claude API..."
+
+              # Stop ollama if running
+              docker compose --profile ollama down ollama 2>/dev/null || true
+
+              # Start voice-app only (no Ollama needed)
+              docker compose up -d voice-app
             fi
-
-            # Start voice-app
-            docker compose up -d voice-app
 
             # Cleanup old images
             docker image prune -f
 
             # Show status
             docker compose ps
-          EOF
+          ENDSSH
 
       - name: Health check
         run: |
@@ -123,10 +152,20 @@ jobs:
           ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
             cd /opt/cocktail-party
 
-            # Check if containers are running
-            if docker compose ps | grep -q "Up"; then
+            # Check if voice-app container is running
+            if docker compose ps voice-app | grep -q "Up"; then
               echo "✅ Deployment successful!"
               docker compose ps
+
+              # Test LLM connectivity
+              LLM_PROVIDER=$(grep -E "^LLM_PROVIDER=" .env | tail -1 | cut -d= -f2)
+              if [ "$LLM_PROVIDER" = "anthropic" ]; then
+                echo "Testing Anthropic API..."
+                docker exec voice-app python -c "import anthropic; print('Anthropic SDK OK')" && echo "✅ Anthropic ready"
+              else
+                echo "Testing Ollama..."
+                docker exec ollama ollama list && echo "✅ Ollama ready"
+              fi
             else
               echo "❌ Deployment failed!"
               docker compose logs --tail=50
