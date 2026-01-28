@@ -187,23 +187,19 @@ def talk():
         should_speak = False
         time_since_chunk = time_module.time() - last_chunk_time
 
-        if first_chunk and len(text_buffer) >= 12:
-            # Start TTS early on first chunk
+        if first_chunk and len(text_buffer) >= 20:
             should_speak = True
             first_chunk = False
-        elif any(p in text_buffer for p in [".", "!", "?"]):
+        elif len(text_buffer) > 40 and any(p in text_buffer for p in [".", "!", "?"]):
             should_speak = True
-        elif len(text_buffer) > 18 and text_buffer[-1] in [",", ";", ":", " "]:
-            should_speak = True
-        elif len(text_buffer) > 35:
+        elif len(text_buffer) > 60:
             # Force speak if buffer getting large
             should_speak = True
-        elif time_since_chunk > 0.4 and len(text_buffer) > 8:
+        elif time_since_chunk > 2.0 and len(text_buffer) > 20:
             # Timeout fallback - don't wait forever
             should_speak = True
 
         if should_speak:
-            last_chunk_time = time_module.time()
             speak_part = text_buffer
             text_buffer = ""
             if someone_talking:
@@ -215,6 +211,9 @@ def talk():
                 if someone_talking:
                     break
                 yield audio_chunk
+            # Reset timer AFTER TTS completes so timeout measures
+            # actual LLM silence, not TTS processing time
+            last_chunk_time = time_module.time()
 
     # 3. Flush any remaining text once LLM is done
     text_buffer = text_buffer.strip()

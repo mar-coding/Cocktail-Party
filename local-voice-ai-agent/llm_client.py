@@ -166,7 +166,7 @@ def build_chat_payload(
 
 def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: int = 150):
     """
-    Stream response from Anthropic Claude API.
+    Stream response from Anthropic Claude API with phrase buffering for smooth TTS.
 
     Args:
         transcript: The conversation transcript to send to the LLM
@@ -174,7 +174,7 @@ def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: 
         max_tokens: Maximum tokens to generate
 
     Yields:
-        str: Text chunks as they arrive from Claude
+        str: Text chunks (buffered into phrases) for TTS
 
     Raises:
         LLMError: If there's an error communicating with the Anthropic API
@@ -183,6 +183,10 @@ def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: 
     if client is None:
         raise LLMError("Anthropic client not initialized - check ANTHROPIC_API_KEY")
 
+    # Punctuation that marks phrase boundaries for TTS chunking
+    PHRASE_ENDINGS = {'.', '!', '?', ',', ';', ':', '—', '–', '\n'}
+    MIN_CHUNK_LENGTH = 20  # Minimum characters before yielding on punctuation
+
     try:
         with client.messages.stream(
             model=ANTHROPIC_MODEL,
@@ -190,8 +194,28 @@ def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: 
             system=system_prompt,
             messages=[{"role": "user", "content": transcript}]
         ) as stream:
+            buffer = ""
             for text in stream.text_stream:
-                yield text.replace("*", "")
+                text = text.replace("*", "")
+                buffer += text
+
+                # Check if we have a complete phrase to yield
+                # Yield when we hit punctuation AND have enough content
+                if len(buffer) >= MIN_CHUNK_LENGTH:
+                    # Find the last phrase boundary
+                    last_boundary = -1
+                    for i, char in enumerate(buffer):
+                        if char in PHRASE_ENDINGS:
+                            last_boundary = i
+
+                    if last_boundary > 0:
+                        # Yield up to and including the punctuation
+                        yield buffer[:last_boundary + 1].strip()
+                        buffer = buffer[last_boundary + 1:]
+
+            # Yield any remaining content
+            if buffer.strip():
+                yield buffer.strip()
     except Exception as e:
         logger.error(f"Anthropic API error: {e}")
         raise LLMError(f"Anthropic API error: {e}")
@@ -231,21 +255,26 @@ def _get_anthropic_response(transcript: str, system_prompt: str, max_tokens: int
 
 def _stream_ollama_response(transcript: str, system_prompt: str):
     """
-    Stream response from Ollama API.
+    Stream response from Ollama API with phrase buffering for smooth TTS.
 
     Args:
         transcript: The conversation transcript to send to the LLM
         system_prompt: The system prompt to use
 
     Yields:
-        str: Text chunks as they arrive from Ollama
+        str: Text chunks (buffered into phrases) for TTS
 
     Raises:
         LLMError: If there's an error communicating with Ollama
     """
     payload = build_chat_payload(transcript, system_prompt=system_prompt)
 
+    # Punctuation that marks phrase boundaries for TTS chunking
+    PHRASE_ENDINGS = {'.', '!', '?', ',', ';', ':', '—', '–', '\n'}
+    MIN_CHUNK_LENGTH = 20  # Minimum characters before yielding on punctuation
+
     try:
+        buffer = ""
         with get_session().post(OLLAMA_URL, json=payload, stream=True, timeout=HTTP_TIMEOUT) as r:
             r.raise_for_status()
             for line in r.iter_lines():
@@ -265,7 +294,24 @@ def _stream_ollama_response(transcript: str, system_prompt: str):
                         chunk = str(data["delta"]).replace("*", "")
 
                 if chunk:
-                    yield chunk
+                    buffer += chunk
+
+                    # Check if we have a complete phrase to yield
+                    if len(buffer) >= MIN_CHUNK_LENGTH:
+                        # Find the last phrase boundary
+                        last_boundary = -1
+                        for i, char in enumerate(buffer):
+                            if char in PHRASE_ENDINGS:
+                                last_boundary = i
+
+                        if last_boundary > 0:
+                            # Yield up to and including the punctuation
+                            yield buffer[:last_boundary + 1].strip()
+                            buffer = buffer[last_boundary + 1:]
+
+            # Yield any remaining content
+            if buffer.strip():
+                yield buffer.strip()
     except requests.exceptions.ReadTimeout:
         logger.error(f"LLM read timed out after {HTTP_READ_TIMEOUT}s - model may be slow or overloaded")
         raise LLMError("LLM response timed out - try increasing HTTP_READ_TIMEOUT")
