@@ -2,7 +2,7 @@
 LLM Client Module
 -----------------
 Contains all payload definitions and functions for interacting with LLM providers.
-Supports multiple providers: Ollama (default) and Anthropic.
+Supports multiple providers: Ollama (default), Anthropic, and vLLM (RunPod).
 """
 
 import os
@@ -15,11 +15,16 @@ from urllib3.util.retry import Retry
 # =============================================================================
 # LLM Provider Configuration
 # =============================================================================
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()  # "ollama" or "anthropic"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()  # "ollama", "anthropic", or "vllm"
 
 # Anthropic settings
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-haiku-20240307")
+
+# vLLM (RunPod) settings
+VLLM_API_TOKEN = os.getenv("VLLM_API_TOKEN", "")
+VLLM_API_ADDRESS = os.getenv("VLLM_API_ADDRESS", "")  # Full base URL
+VLLM_MODEL = os.getenv("VLLM_MODEL", "google/gemma-3-4b-it")
 
 # =============================================================================
 # Connection Pooling for Reduced Latency
@@ -65,6 +70,25 @@ def get_anthropic_client():
         except ImportError:
             logger.error("anthropic package not installed. Run: pip install anthropic")
     return _anthropic_client
+
+
+# =============================================================================
+# vLLM Client (Lazy Initialization)
+# =============================================================================
+_vllm_client = None
+
+
+def get_vllm_client():
+    """Get a lazy-initialized vLLM (OpenAI-compatible) client."""
+    global _vllm_client
+    if _vllm_client is None and VLLM_API_TOKEN and VLLM_API_ADDRESS:
+        try:
+            from openai import OpenAI
+            _vllm_client = OpenAI(api_key=VLLM_API_TOKEN, base_url=VLLM_API_ADDRESS)
+            logger.info(f"vLLM client initialized: model={VLLM_MODEL}, endpoint={VLLM_API_ADDRESS}")
+        except ImportError:
+            logger.error("openai package not installed. Run: pip install openai")
+    return _vllm_client
 
 
 # Production mode flag
@@ -156,6 +180,7 @@ def build_chat_payload(
             {"role": "user", "content": user_content},
         ],
         "options": {"num_predict": num_predict},
+        "keep_alive": "30m",
         "stream": stream,
     }
 
@@ -166,7 +191,8 @@ def build_chat_payload(
 
 def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: int = 150):
     """
-    Stream response from Anthropic Claude API with phrase buffering for smooth TTS.
+    Stream response from Anthropic Claude API, yielding raw tokens.
+    Phrase buffering for TTS is handled downstream by talk().
 
     Args:
         transcript: The conversation transcript to send to the LLM
@@ -174,7 +200,7 @@ def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: 
         max_tokens: Maximum tokens to generate
 
     Yields:
-        str: Text chunks (buffered into phrases) for TTS
+        str: Raw text tokens as they arrive from the API
 
     Raises:
         LLMError: If there's an error communicating with the Anthropic API
@@ -183,10 +209,6 @@ def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: 
     if client is None:
         raise LLMError("Anthropic client not initialized - check ANTHROPIC_API_KEY")
 
-    # Punctuation that marks phrase boundaries for TTS chunking
-    PHRASE_ENDINGS = {'.', '!', '?', ',', ';', ':', '—', '–', '\n'}
-    MIN_CHUNK_LENGTH = 20  # Minimum characters before yielding on punctuation
-
     try:
         with client.messages.stream(
             model=ANTHROPIC_MODEL,
@@ -194,28 +216,10 @@ def _stream_anthropic_response(transcript: str, system_prompt: str, max_tokens: 
             system=system_prompt,
             messages=[{"role": "user", "content": transcript}]
         ) as stream:
-            buffer = ""
             for text in stream.text_stream:
                 text = text.replace("*", "")
-                buffer += text
-
-                # Check if we have a complete phrase to yield
-                # Yield when we hit punctuation AND have enough content
-                if len(buffer) >= MIN_CHUNK_LENGTH:
-                    # Find the last phrase boundary
-                    last_boundary = -1
-                    for i, char in enumerate(buffer):
-                        if char in PHRASE_ENDINGS:
-                            last_boundary = i
-
-                    if last_boundary > 0:
-                        # Yield up to and including the punctuation
-                        yield buffer[:last_boundary + 1].strip()
-                        buffer = buffer[last_boundary + 1:]
-
-            # Yield any remaining content
-            if buffer.strip():
-                yield buffer.strip()
+                if text:
+                    yield text
     except Exception as e:
         logger.error(f"Anthropic API error: {e}")
         raise LLMError(f"Anthropic API error: {e}")
@@ -255,26 +259,22 @@ def _get_anthropic_response(transcript: str, system_prompt: str, max_tokens: int
 
 def _stream_ollama_response(transcript: str, system_prompt: str):
     """
-    Stream response from Ollama API with phrase buffering for smooth TTS.
+    Stream response from Ollama API, yielding raw tokens.
+    Phrase buffering for TTS is handled downstream by talk().
 
     Args:
         transcript: The conversation transcript to send to the LLM
         system_prompt: The system prompt to use
 
     Yields:
-        str: Text chunks (buffered into phrases) for TTS
+        str: Raw text tokens as they arrive from the API
 
     Raises:
         LLMError: If there's an error communicating with Ollama
     """
     payload = build_chat_payload(transcript, system_prompt=system_prompt)
 
-    # Punctuation that marks phrase boundaries for TTS chunking
-    PHRASE_ENDINGS = {'.', '!', '?', ',', ';', ':', '—', '–', '\n'}
-    MIN_CHUNK_LENGTH = 20  # Minimum characters before yielding on punctuation
-
     try:
-        buffer = ""
         with get_session().post(OLLAMA_URL, json=payload, stream=True, timeout=HTTP_TIMEOUT) as r:
             r.raise_for_status()
             for line in r.iter_lines():
@@ -294,24 +294,7 @@ def _stream_ollama_response(transcript: str, system_prompt: str):
                         chunk = str(data["delta"]).replace("*", "")
 
                 if chunk:
-                    buffer += chunk
-
-                    # Check if we have a complete phrase to yield
-                    if len(buffer) >= MIN_CHUNK_LENGTH:
-                        # Find the last phrase boundary
-                        last_boundary = -1
-                        for i, char in enumerate(buffer):
-                            if char in PHRASE_ENDINGS:
-                                last_boundary = i
-
-                        if last_boundary > 0:
-                            # Yield up to and including the punctuation
-                            yield buffer[:last_boundary + 1].strip()
-                            buffer = buffer[last_boundary + 1:]
-
-            # Yield any remaining content
-            if buffer.strip():
-                yield buffer.strip()
+                    yield chunk
     except requests.exceptions.ReadTimeout:
         logger.error(f"LLM read timed out after {HTTP_READ_TIMEOUT}s - model may be slow or overloaded")
         raise LLMError("LLM response timed out - try increasing HTTP_READ_TIMEOUT")
@@ -328,6 +311,85 @@ def _stream_ollama_response(transcript: str, system_prompt: str):
         error_body = e.response.text if e.response else "No response body"
         logger.error(f"LLM service returned an error: {e.response.status_code} - {error_body}")
         raise LLMError(f"LLM service returned an error: {error_body}")
+
+
+def _stream_vllm_response(transcript: str, system_prompt: str, max_tokens: int = 250):
+    """
+    Stream response from vLLM (OpenAI-compatible) API, yielding raw tokens.
+
+    Args:
+        transcript: The conversation transcript to send to the LLM
+        system_prompt: The system prompt to use
+        max_tokens: Maximum tokens to generate
+
+    Yields:
+        str: Raw text tokens as they arrive from the API
+
+    Raises:
+        LLMError: If there's an error communicating with the vLLM API
+    """
+    client = get_vllm_client()
+    if client is None:
+        raise LLMError("vLLM client not initialized - check VLLM_API_TOKEN and VLLM_API_ADDRESS")
+
+    try:
+        stream = client.chat.completions.create(
+            model=VLLM_MODEL,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            stop=["User:", "AI:", "\nUser", "\nAI"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": transcript},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                text = chunk.choices[0].delta.content.replace("*", "")
+                if text:
+                    yield text
+    except Exception as e:
+        logger.error(f"vLLM API error: {e}")
+        raise LLMError(f"vLLM API error: {e}")
+
+
+def _get_vllm_response(transcript: str, system_prompt: str, max_tokens: int = 150) -> str:
+    """
+    Get a complete (non-streaming) response from vLLM (OpenAI-compatible) API.
+
+    Args:
+        transcript: The conversation transcript to send to the LLM
+        system_prompt: The system prompt to use
+        max_tokens: Maximum tokens to generate
+
+    Returns:
+        str: The complete response text
+
+    Raises:
+        LLMError: If there's an error communicating with the vLLM API
+    """
+    client = get_vllm_client()
+    if client is None:
+        raise LLMError("vLLM client not initialized - check VLLM_API_TOKEN and VLLM_API_ADDRESS")
+
+    try:
+        response = client.chat.completions.create(
+            model=VLLM_MODEL,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            stop=["User:", "AI:", "\nUser", "\nAI"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": transcript},
+            ],
+        )
+        if response.choices and response.choices[0].message.content:
+            return response.choices[0].message.content.replace("*", "")
+        return ""
+    except Exception as e:
+        logger.error(f"vLLM API error: {e}")
+        raise LLMError(f"vLLM API error: {e}")
 
 
 def stream_llm_response(transcript: str, system_prompt: str = COCKTAIL_PARTY_PROMPT,
@@ -363,6 +425,8 @@ def stream_llm_response(transcript: str, system_prompt: str = COCKTAIL_PARTY_PRO
     # Route to appropriate provider
     if LLM_PROVIDER == "anthropic":
         yield from _stream_anthropic_response(transcript, selected_prompt)
+    elif LLM_PROVIDER == "vllm":
+        yield from _stream_vllm_response(transcript, selected_prompt)
     else:
         yield from _stream_ollama_response(transcript, selected_prompt)
 
@@ -385,6 +449,8 @@ def get_llm_response(transcript: str, system_prompt: str = SUMMARY_PROMPT, summa
     # Route to appropriate provider
     if LLM_PROVIDER == "anthropic":
         return _get_anthropic_response(transcript, system_prompt)
+    elif LLM_PROVIDER == "vllm":
+        return _get_vllm_response(transcript, system_prompt)
 
     # Ollama path
     payload = build_chat_payload(transcript, system_prompt=system_prompt, stream=False)

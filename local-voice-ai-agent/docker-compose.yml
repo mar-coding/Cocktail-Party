@@ -71,6 +71,10 @@ services:
       # Ollama Configuration
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+      # vLLM (RunPod) Configuration
+      - VLLM_API_TOKEN=${VLLM_API_TOKEN:-}
+      - VLLM_API_ADDRESS=${VLLM_API_ADDRESS:-}
+      - VLLM_MODEL=${VLLM_MODEL:-google/gemma-3-4b-it}
       - HF_TOKEN=${HF_TOKEN:-}
       - DOCKER_CONTAINER=true
       - GRADIO_SERVER_NAME=0.0.0.0
@@ -133,6 +137,10 @@ services:
       # Ollama Configuration
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+      # vLLM (RunPod) Configuration
+      - VLLM_API_TOKEN=${VLLM_API_TOKEN:-}
+      - VLLM_API_ADDRESS=${VLLM_API_ADDRESS:-}
+      - VLLM_MODEL=${VLLM_MODEL:-google/gemma-3-4b-it}
       - HF_TOKEN=${HF_TOKEN:-}
       - DOCKER_CONTAINER=true
       - GRADIO_SERVER_NAME=0.0.0.0

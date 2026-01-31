@@ -2,9 +2,13 @@ import sys
 import os
 import argparse
 import threading
+import asyncio
+import queue as queue_module
 
 from fastrtc import ReplyOnPause, Stream, get_stt_model, get_tts_model, get_hf_turn_credentials, AlgoOptions, SileroVadOptions
 from loguru import logger
+
+
 import gradio as gr
 import numpy as np
 import time as time_module  # rename to avoid conflict with callback's 'time' param
@@ -13,6 +17,21 @@ from utilities import extract_transcript, extract_last_replies, back_and_forth, 
 
 from llm_client import stream_llm_response, get_llm_response
 from speaker_diarizer import identify_speaker, USE_DIARIZATION
+
+# =============================================================================
+# Suppress known aioice cleanup errors (STUN retry after transport closed).
+# Patched at CLASS level so it works on ALL event loops (including Gradio's).
+# =============================================================================
+_original_default_exception_handler = asyncio.BaseEventLoop.default_exception_handler
+
+def _ice_exception_handler(self, context):
+    exception = context.get("exception")
+    if isinstance(exception, AttributeError) and "'NoneType'" in str(exception):
+        if "sendto" in str(exception):
+            return
+    _original_default_exception_handler(self, context)
+
+asyncio.BaseEventLoop.default_exception_handler = _ice_exception_handler
 
 # =============================================================================
 # Environment Configuration
@@ -58,22 +77,43 @@ tts_model = get_tts_model()  # kokoro
 def warmup_models():
     """Warm up models to reduce first inference latency."""
     logger.info("Warming up models...")
-    # Warm STT with silent audio
     try:
         stt_model.stt((16000, np.zeros(16000, dtype=np.float32)))
     except Exception:
         pass
-    # Warm TTS with short phrase
     try:
         for _ in tts_model.stream_tts_sync("Hi"):
             break
     except Exception:
         pass
+    _warmup_llm()
     logger.info("Model warm-up complete")
 
-# Call warm-up in non-Docker mode or optionally in Docker
-if not DOCKER_MODE:
-    warmup_models()
+
+def _warmup_llm(max_retries=5, retry_delay=3):
+    """Send a minimal LLM request to force Ollama model loading.
+    Retries on failure since Ollama may still be starting in Docker.
+    """
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"LLM warmup attempt {attempt + 1}/{max_retries}...")
+            for chunk in stream_llm_response("Hi", alone=False, is_back_and_forth=False):
+                logger.info("LLM warmup successful - model loaded")
+                return
+            logger.info("LLM warmup completed")
+            return
+        except Exception as e:
+            logger.warning(f"LLM warmup attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Retrying in {retry_delay}s...")
+                time_module.sleep(retry_delay)
+            else:
+                logger.warning("LLM warmup failed after all retries - first inference will be slow")
+
+
+# Always warm up — LLM warmup is critical even in Docker
+# (Ollama runs in a separate container and needs model loading)
+warmup_models()
 
 # Track the current selected input device (None means use default)
 selected_input_device = None
@@ -154,15 +194,34 @@ last_voice_detected=0.0
 last_summary_time=0
 summary="\nSummary:\n"
 
+_LLM_DONE = object()
+
+class _LLMError:
+    """Wrapper for exceptions from the LLM background thread."""
+    def __init__(self, exception):
+        self.exception = exception
+
+def _llm_stream_worker(token_queue, stop_event, context, alone, is_back_and_forth):
+    """Background thread: streams LLM tokens into a queue."""
+    try:
+        for chunk in stream_llm_response(context, alone=alone, is_back_and_forth=is_back_and_forth):
+            if stop_event.is_set():
+                break
+            token_queue.put(chunk)
+    except Exception as e:
+        logger.error(f"LLM streaming error in background thread: {e}")
+        token_queue.put(_LLMError(e))
+    finally:
+        token_queue.put(_LLM_DONE)
+
 def talk():
     global conversation, someone_talking, last_voice_detected, summary
     logger.debug("Starting to talk...")
     text_buffer = ""
     ai_reply = "AI:"
     alone = all(r.startswith("AI:") for r in extract_last_replies(conversation, 2))
-    is_back_and_forth = back_and_forth(conversation, 6)  # 3 back and forths
+    is_back_and_forth = back_and_forth(conversation, 6)
 
-    # Determine context to send
     if alone:
         context = "\n".join(extract_last_replies(conversation, 2))
     elif is_back_and_forth:
@@ -172,62 +231,101 @@ def talk():
             logger.debug("summary activated")
         context = summary + conversation
 
-    # Track first chunk and timing for faster initial response
+    # Silence frame: 100ms at 24kHz (matches Kokoro TTS sample rate)
+    silence_frame = (24000, np.zeros(2400, dtype=np.float32))
+
+    token_queue = queue_module.Queue(maxsize=100)
+    stop_event = threading.Event()
+
+    llm_thread = threading.Thread(
+        target=_llm_stream_worker,
+        args=(token_queue, stop_event, context, alone, is_back_and_forth),
+        daemon=True,
+    )
+    llm_thread.start()
+
     first_chunk = True
     last_chunk_time = time_module.time()
+    first_token_logged = False
+    llm_done = False
 
-    # 1. Stream text from LLM as it's generated
-    for chunk in stream_llm_response(context, alone=alone, is_back_and_forth=is_back_and_forth):
-        text_buffer += chunk
-        ai_reply += chunk
-        if someone_talking:
-            break
-
-        # More aggressive chunking for faster response
-        should_speak = False
-        time_since_chunk = time_module.time() - last_chunk_time
-
-        if first_chunk and len(text_buffer) >= 20:
-            should_speak = True
-            first_chunk = False
-        elif len(text_buffer) > 40 and any(p in text_buffer for p in [".", "!", "?"]):
-            should_speak = True
-        elif len(text_buffer) > 60:
-            # Force speak if buffer getting large
-            should_speak = True
-        elif time_since_chunk > 2.0 and len(text_buffer) > 20:
-            # Timeout fallback - don't wait forever
-            should_speak = True
-
-        if should_speak:
-            speak_part = text_buffer
-            text_buffer = ""
+    try:
+        while not llm_done:
             if someone_talking:
                 break
 
-            logger.debug(f"TTS on chunk: {speak_part!r}")
-            # 2. Stream TTS for that chunk
-            for audio_chunk in tts_model.stream_tts_sync(speak_part):
+            try:
+                token = token_queue.get(timeout=0.1)
+            except queue_module.Empty:
+                yield silence_frame
+                continue
+
+            if token is _LLM_DONE:
+                llm_done = True
+                break
+
+            if isinstance(token, _LLMError):
+                logger.error(f"LLM error: {token.exception}")
+                llm_done = True
+                break
+
+            if not first_token_logged:
+                logger.debug(f"First LLM token after {time_module.time() - last_chunk_time:.2f}s")
+                first_token_logged = True
+
+            text_buffer += token
+            ai_reply += token
+
+            should_speak = False
+            time_since_chunk = time_module.time() - last_chunk_time
+
+            if first_chunk and len(text_buffer) >= 12:
+                should_speak = True
+                first_chunk = False
+            elif any(p in text_buffer for p in [".", "!", "?"]):
+                should_speak = True
+            elif len(text_buffer) > 18 and text_buffer[-1] in [",", ";", ":", " "]:
+                should_speak = True
+            elif len(text_buffer) > 35:
+                should_speak = True
+            elif time_since_chunk > 1.0 and len(text_buffer) > 8:
+                should_speak = True
+
+            if should_speak:
+                speak_part = text_buffer
+                text_buffer = ""
+                if someone_talking:
+                    break
+
+                logger.debug(f"TTS on chunk: {speak_part!r}")
+                for audio_chunk in tts_model.stream_tts_sync(speak_part):
+                    if someone_talking:
+                        break
+                    yield audio_chunk
+                last_chunk_time = time_module.time()
+
+        # Flush remaining text
+        text_buffer = text_buffer.strip()
+        if someone_talking:
+            return
+
+        if text_buffer:
+            ai_reply += text_buffer
+            logger.debug(f"TTS on final chunk: {text_buffer!r}")
+            for audio_chunk in tts_model.stream_tts_sync(text_buffer):
                 if someone_talking:
                     break
                 yield audio_chunk
-            # Reset timer AFTER TTS completes so timeout measures
-            # actual LLM silence, not TTS processing time
-            last_chunk_time = time_module.time()
 
-    # 3. Flush any remaining text once LLM is done
-    text_buffer = text_buffer.strip()
-    if someone_talking:
-        return False
+        conversation += "\n" + ai_reply
 
-    if text_buffer:
-        ai_reply += text_buffer
-        logger.debug(f"TTS on final chunk: {text_buffer!r}")
-        for audio_chunk in tts_model.stream_tts_sync(text_buffer):
-            if someone_talking:
+    finally:
+        stop_event.set()
+        while not token_queue.empty():
+            try:
+                token_queue.get_nowait()
+            except queue_module.Empty:
                 break
-            yield audio_chunk
-    conversation += "\n" + ai_reply
 
 
 
