@@ -39,7 +39,7 @@ def extract_last_replies(text: str, n: int = 4) -> list[str]:
     return replies[-n:]
 
 
-def back_and_forth(transcript: str, n: int = 4) -> str:
+def back_and_forth(transcript: str, n: int = 4) -> bool:
     last = extract_last_replies(transcript, n)
     if len(last) < n:
         return False

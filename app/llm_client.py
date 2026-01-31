@@ -150,7 +150,7 @@ CONTRIBUTION_PROMPT = (
 def build_chat_payload(
     user_content: str,
     system_prompt: str = COCKTAIL_PARTY_PROMPT,
-    model: str = None,
+    model: str | None = None,
     num_predict: int = 100,
     stream: bool = True,
 ) -> dict:
@@ -439,7 +439,7 @@ def get_llm_response(
 def stream_custom_chat(
     user_content: str,
     system_prompt: str,
-    model: str = None,
+    model: str | None = None,
     num_predict: int = 600,
 ):
     """
