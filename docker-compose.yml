@@ -27,9 +27,9 @@ services:
       resources:
         limits:
           cpus: '2'
-          memory: 8G
+          memory: 5G
         reservations:
-          memory: 4G
+          memory: 2G
 
   # ============================================================================
   # Ollama Model Puller - One-time model download
