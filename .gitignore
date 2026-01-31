@@ -14,3 +14,5 @@ app/.gradio/
 
 # SSL certificates (generated locally)
 certs/
+*/.DS_Store
+.DS_Store
