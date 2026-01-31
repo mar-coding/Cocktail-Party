@@ -68,7 +68,7 @@ certs:
 	@echo "Generating SSL certificates..."
 	@mkdir -p certs
 	@if [ ! -f certs/cert.pem ]; then \
-		./generate-certs.sh; \
+		./scripts/generate-certs.sh; \
 	else \
 		echo "Certificates already exist. Delete certs/ to regenerate."; \
 	fi
