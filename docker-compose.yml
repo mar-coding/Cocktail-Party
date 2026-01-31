@@ -21,6 +21,8 @@ services:
     restart: unless-stopped
     networks:
       - cocktail-party-network
+    profiles:
+      - ollama  # Only start when using Docker-based Ollama
     deploy:
       resources:
         limits:
@@ -43,8 +45,10 @@ services:
     environment:
       - OLLAMA_HOST=http://ollama:11434
     entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-gemma3:4b}"]
+    networks:
+      - cocktail-party-network
     profiles:
-      - setup
+      - ollama  # Only needed for Docker-based Ollama setup
 
   # ============================================================================
   # Voice AI Application - Production
@@ -60,8 +64,15 @@ services:
     expose:
       - "7860"
     environment:
-      - OLLAMA_HOST=http://ollama:11434
+      # LLM Provider Configuration
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      # Ollama Configuration
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+      # vLLM (RunPod) Configuration
+      - VLLM_API_TOKEN=${VLLM_API_TOKEN:-}
+      - VLLM_API_ADDRESS=${VLLM_API_ADDRESS:-}
+      - VLLM_MODEL=${VLLM_MODEL:-google/gemma-3-4b-it}
       - HF_TOKEN=${HF_TOKEN:-}
       - DOCKER_CONTAINER=true
       - GRADIO_SERVER_NAME=0.0.0.0
@@ -73,8 +84,11 @@ services:
       - GRADIO_PASSWORD=${GRADIO_PASSWORD:-}
       # Set to true when behind Nginx Proxy Manager (SSL handled by proxy)
       - BEHIND_PROXY=${BEHIND_PROXY:-false}
-      # HTTP request timeout for LLM calls
-      - HTTP_TIMEOUT=${HTTP_TIMEOUT:-30}
+      # HTTP request timeouts for LLM calls
+      - HTTP_CONNECT_TIMEOUT=${HTTP_CONNECT_TIMEOUT:-10}
+      - HTTP_READ_TIMEOUT=${HTTP_READ_TIMEOUT:-120}
+      # Maximum concurrent WebRTC connections
+      - MAX_CONCURRENT_CONNECTIONS=${MAX_CONCURRENT_CONNECTIONS:-6}
       # SSL configuration for HTTPS (required for microphone access when not behind proxy)
       - GRADIO_SSL_CERTFILE=/app/certs/cert.pem
       - GRADIO_SSL_KEYFILE=/app/certs/key.pem
@@ -82,9 +96,7 @@ services:
       - hf_cache:/home/voiceai/.cache/huggingface
       - kokoro_cache:/home/voiceai/.cache/kokoro
       - ./certs:/app/certs:ro
-    depends_on:
-      ollama:
-        condition: service_healthy
+    # Note: No depends_on for ollama - use profiles to start ollama when needed
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7860/"]
       interval: 30s
@@ -117,8 +129,15 @@ services:
       # Open to all interfaces in development for easier testing
       - "7860:7860"
     environment:
-      - OLLAMA_HOST=http://ollama:11434
+      # LLM Provider Configuration
+      - LLM_PROVIDER=${LLM_PROVIDER:-ollama}
+      # Ollama Configuration
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
       - OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+      # vLLM (RunPod) Configuration
+      - VLLM_API_TOKEN=${VLLM_API_TOKEN:-}
+      - VLLM_API_ADDRESS=${VLLM_API_ADDRESS:-}
+      - VLLM_MODEL=${VLLM_MODEL:-google/gemma-3-4b-it}
       - HF_TOKEN=${HF_TOKEN:-}
       - DOCKER_CONTAINER=true
       - GRADIO_SERVER_NAME=0.0.0.0
@@ -126,19 +145,20 @@ services:
       # Development mode - disables authentication, enables debug logging
       - IS_PROD=false
       - BEHIND_PROXY=false
-      - HTTP_TIMEOUT=30
+      - HTTP_CONNECT_TIMEOUT=${HTTP_CONNECT_TIMEOUT:-10}
+      - HTTP_READ_TIMEOUT=${HTTP_READ_TIMEOUT:-120}
+      # Maximum concurrent WebRTC connections
+      - MAX_CONCURRENT_CONNECTIONS=${MAX_CONCURRENT_CONNECTIONS:-6}
       # SSL configuration for HTTPS (required for microphone access)
       - GRADIO_SSL_CERTFILE=/app/certs/cert.pem
       - GRADIO_SSL_KEYFILE=/app/certs/key.pem
     volumes:
-      - .:/app:ro
+      - ./app:/app:ro
       - /app/.venv  # Preserve .venv from Docker build (don't overwrite with host)
       - hf_cache:/home/voiceai/.cache/huggingface
       - kokoro_cache:/home/voiceai/.cache/kokoro
       - ./certs:/app/certs:ro
-    depends_on:
-      ollama:
-        condition: service_healthy
+    # Note: No depends_on for ollama - use profiles to start ollama when needed
     healthcheck:
       test: ["CMD", "curl", "-fk", "https://localhost:7860/"]
       interval: 30s

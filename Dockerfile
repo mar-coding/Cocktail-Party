@@ -1,22 +1,18 @@
+# syntax=docker/dockerfile:1
 # ============================================================================
-# Stage 1: Builder - Build FFmpeg 7 and install dependencies with uv
+# Stage 1: FFmpeg Builder - Build FFmpeg 7 from source (cached independently)
 # ============================================================================
-FROM python:3.13-slim-bookworm AS builder
+# This stage only rebuilds when the FFmpeg version or codec flags change.
+# Changing pyproject.toml / uv.lock will NOT trigger a recompile.
+FROM python:3.13-slim-bookworm AS ffmpeg-builder
 
-# Install build dependencies for PyAV and FFmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
-    git \
     wget \
     xz-utils \
     nasm \
     yasm \
-    cmake \
-    libportaudio2 \
-    libportaudiocpp0 \
-    portaudio19-dev \
-    libsndfile1-dev \
     libx264-dev \
     libx265-dev \
     libvpx-dev \
@@ -28,7 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libaom-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build FFmpeg 7 from source
 WORKDIR /tmp
 RUN wget -q https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz && \
     tar -xf ffmpeg-7.0.2.tar.xz && \
@@ -52,25 +47,60 @@ RUN wget -q https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz && \
     ldconfig && \
     cd / && rm -rf /tmp/ffmpeg*
 
-# Update library path for FFmpeg
+# ============================================================================
+# Stage 2: Python Deps - Install Python packages with uv
+# ============================================================================
+# Rebuilds only when pyproject.toml or uv.lock change.
+# FFmpeg libs are copied from the cached ffmpeg-builder stage.
+FROM python:3.13-slim-bookworm AS python-builder
+
+# Install build deps needed for Python packages (PyAV, audio libs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    git \
+    libportaudio2 \
+    libportaudiocpp0 \
+    portaudio19-dev \
+    libsndfile1-dev \
+    libx264-dev \
+    libx265-dev \
+    libvpx-dev \
+    libmp3lame-dev \
+    libopus-dev \
+    libvorbis-dev \
+    libtheora-dev \
+    zlib1g-dev \
+    libaom-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy FFmpeg from stage 1
+COPY --from=ffmpeg-builder /usr/local/bin/ff* /usr/local/bin/
+COPY --from=ffmpeg-builder /usr/local/lib/libav* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/libsw* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/libpostproc* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/pkgconfig/ /usr/local/lib/pkgconfig/
+COPY --from=ffmpeg-builder /usr/local/include/ /usr/local/include/
+RUN ldconfig
+
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Set working directory
 WORKDIR /app
 
-# Copy dependency files first (for layer caching)
-COPY pyproject.toml uv.lock ./
+# Copy dependency files first (layer caching)
+COPY app/pyproject.toml app/uv.lock ./
 
-# Create virtual environment and sync dependencies
-RUN uv venv /app/.venv && \
+# Create venv and install deps; cache uv downloads across builds
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv /app/.venv && \
     uv sync --frozen --no-dev
 
 # ============================================================================
-# Stage 2: Runtime - Minimal production image
+# Stage 3: Runtime - Minimal production image
 # ============================================================================
 FROM python:3.13-slim-bookworm AS runtime
 
@@ -91,11 +121,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libaom3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy FFmpeg from builder
-COPY --from=builder /usr/local/bin/ff* /usr/local/bin/
-COPY --from=builder /usr/local/lib/libav* /usr/local/lib/
-COPY --from=builder /usr/local/lib/libsw* /usr/local/lib/
-COPY --from=builder /usr/local/lib/libpostproc* /usr/local/lib/
+# Copy FFmpeg binaries and libs from ffmpeg-builder
+COPY --from=ffmpeg-builder /usr/local/bin/ff* /usr/local/bin/
+COPY --from=ffmpeg-builder /usr/local/lib/libav* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/libsw* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/libpostproc* /usr/local/lib/
 
 # Update library cache
 RUN ldconfig
@@ -107,11 +137,11 @@ RUN groupadd --gid 1000 voiceai && \
 # Set working directory
 WORKDIR /app
 
-# Copy virtual environment from builder
-COPY --from=builder /app/.venv /app/.venv
+# Copy virtual environment from python-builder
+COPY --from=python-builder /app/.venv /app/.venv
 
 # Copy application source
-COPY --chown=voiceai:voiceai . .
+COPY --chown=voiceai:voiceai app .
 
 # Set environment variables
 ENV PATH="/app/.venv/bin:$PATH" \

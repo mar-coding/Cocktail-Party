@@ -7,7 +7,7 @@ on:
   workflow_dispatch:  # Allow manual trigger
 
 env:
-  APP_DIR: local-voice-ai-agent
+  APP_DIR: app
   DEPLOY_PATH: /opt/cocktail-party
 
 jobs:
@@ -25,7 +25,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Validate Python syntax
         run: |
@@ -34,7 +34,6 @@ jobs:
 
       - name: Validate Docker Compose
         run: |
-          cd ${{ env.APP_DIR }}
           docker compose config --quiet
 
   # ==========================================================================
@@ -59,20 +58,27 @@ jobs:
 
       - name: Create .env file
         run: |
-          cd ${{ env.APP_DIR }}
           cat > .env << EOF
           IS_PROD=true
           GRADIO_USERNAME=${{ secrets.GRADIO_USERNAME }}
           GRADIO_PASSWORD=${{ secrets.GRADIO_PASSWORD }}
           HF_TOKEN=${{ secrets.HF_TOKEN }}
+          LLM_PROVIDER=${{ secrets.LLM_PROVIDER }}
           OLLAMA_HOST=http://ollama:11434
           OLLAMA_MODEL=gemma3:4b
+          VLLM_API_TOKEN=${{ secrets.VLLM_API_TOKEN }}
+          VLLM_API_ADDRESS=${{ secrets.VLLM_API_ADDRESS }}
+          VLLM_MODEL=${{ secrets.VLLM_MODEL }}
           GRADIO_SERVER_NAME=0.0.0.0
           GRADIO_SERVER_PORT=7860
           DOCKER_CONTAINER=true
           BEHIND_PROXY=true
-          HTTP_TIMEOUT=30
+          HTTP_CONNECT_TIMEOUT=10
+          HTTP_READ_TIMEOUT=120
+          MAX_CONCURRENT_CONNECTIONS=6
           EOF
+          # Remove leading whitespace from .env
+          sed -i 's/^[[:space:]]*//' .env
 
       - name: Deploy to VPS
         run: |
@@ -82,39 +88,88 @@ jobs:
             --exclude='*.pyc' \
             --exclude='.venv' \
             --exclude='.mypy_cache' \
-            ${{ env.APP_DIR }}/ \
+            --exclude='certs/*.pem' \
+            --exclude='.idea' \
+            --exclude='.ruff_cache' \
+            --exclude='.DS_Store' \
+            --exclude='.gradio' \
+            --exclude='app/certs' \
+            ./ \
             ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ env.DEPLOY_PATH }}/
 
       - name: Build and restart containers
         run: |
-          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
+          ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'ENDSSH'
             cd /opt/cocktail-party
+
+            # Read LLM_PROVIDER from .env
+            LLM_PROVIDER=$(grep -E "^LLM_PROVIDER=" .env | tail -1 | cut -d= -f2)
+            echo "LLM Provider: $LLM_PROVIDER"
 
             # Build new images
             docker compose build --pull
 
-            # Start Ollama first
-            docker compose up -d ollama
+            # Ensure web_proxy network exists (created by Nginx Proxy Manager)
+            docker network create web_proxy 2>/dev/null || true
 
-            # Wait for Ollama to be healthy
-            echo "Waiting for Ollama to be ready..."
-            sleep 10
+            if [ "$LLM_PROVIDER" = "ollama" ]; then
+              echo "Starting with Docker Ollama..."
 
-            # Pull model if not exists
-            if ! docker exec ollama ollama list | grep -q "gemma3:4b"; then
-              echo "Pulling gemma3:4b model (this may take a few minutes)..."
-              docker exec ollama ollama pull gemma3:4b
+              # Get model name from .env
+              OLLAMA_MODEL=$(grep -E "^OLLAMA_MODEL=" .env | tail -1 | cut -d= -f2)
+              OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+              echo "Ollama Model: $OLLAMA_MODEL"
+
+              # Start Ollama first
+              docker compose --profile ollama up -d ollama
+
+              # Wait for Ollama to be healthy
+              echo "Waiting for Ollama to be ready..."
+              sleep 15
+
+              # Pull model if not exists
+              if ! docker exec ollama ollama list | grep -q "$OLLAMA_MODEL"; then
+                echo "Pulling $OLLAMA_MODEL model (this may take a few minutes)..."
+                docker exec ollama ollama pull "$OLLAMA_MODEL"
+              fi
+
+              # Start voice-app with ollama profile
+              docker compose --profile ollama up -d voice-app
+
+            elif [ "$LLM_PROVIDER" = "vllm" ]; then
+              echo "Starting with vLLM (no Ollama needed)..."
+
+              # Stop ollama if running from a previous deployment
+              docker compose --profile ollama down ollama 2>/dev/null || true
+
+              # Start voice-app only
+              docker compose up -d voice-app
+
+            else
+              echo "Unknown LLM_PROVIDER '$LLM_PROVIDER', defaulting to ollama..."
+
+              OLLAMA_MODEL=$(grep -E "^OLLAMA_MODEL=" .env | tail -1 | cut -d= -f2)
+              OLLAMA_MODEL=${OLLAMA_MODEL:-gemma3:4b}
+
+              docker compose --profile ollama up -d ollama
+              sleep 15
+
+              if ! docker exec ollama ollama list | grep -q "$OLLAMA_MODEL"; then
+                docker exec ollama ollama pull "$OLLAMA_MODEL"
+              fi
+
+              docker compose --profile ollama up -d voice-app
             fi
 
-            # Start voice-app
-            docker compose up -d voice-app
+            # Connect voice-app to web_proxy so Nginx Proxy Manager can reach it
+            docker network connect web_proxy voice-app 2>/dev/null || true
 
             # Cleanup old images
             docker image prune -f
 
             # Show status
             docker compose ps
-          EOF
+          ENDSSH
 
       - name: Health check
         run: |
@@ -123,10 +178,20 @@ jobs:
           ssh ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'EOF'
             cd /opt/cocktail-party
 
-            # Check if containers are running
-            if docker compose ps | grep -q "Up"; then
+            # Check if voice-app container is running
+            if docker compose ps voice-app | grep -q "Up"; then
               echo "✅ Deployment successful!"
               docker compose ps
+
+              # Test LLM connectivity based on provider
+              LLM_PROVIDER=$(grep -E "^LLM_PROVIDER=" .env | tail -1 | cut -d= -f2)
+              if [ "$LLM_PROVIDER" = "vllm" ]; then
+                echo "Testing vLLM (OpenAI SDK)..."
+                docker exec voice-app python -c "from openai import OpenAI; print('OpenAI SDK OK')" && echo "✅ vLLM ready"
+              else
+                echo "Testing Ollama..."
+                docker exec ollama ollama list && echo "✅ Ollama ready"
+              fi
             else
               echo "❌ Deployment failed!"
               docker compose logs --tail=50

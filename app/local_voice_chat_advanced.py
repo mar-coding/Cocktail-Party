@@ -3,13 +3,19 @@ import os
 import argparse
 import threading
 
-from fastrtc import ReplyOnPause, Stream, get_stt_model, get_tts_model, get_hf_turn_credentials
+from fastrtc import (
+    ReplyOnPause,
+    Stream,
+    get_stt_model,
+    get_tts_model,
+    get_hf_turn_credentials,
+)
 from loguru import logger
 import gradio as gr
 import numpy as np
 import time as time_module  # rename to avoid conflict with callback's 'time' param
 import sounddevice as sd
-from utilities import extract_transcript, extract_last_replies, back_and_forth
+from utilities import extract_last_replies, back_and_forth
 
 from llm_client import stream_llm_response, get_llm_response
 
@@ -40,23 +46,26 @@ tts_model = get_tts_model()  # kokoro
 selected_input_device = None
 audio_monitor_thread = None
 
+
 def get_input_devices():
     """Returns list of available input (microphone) devices."""
     devices = sd.query_devices()
     input_devices = []
     for i, d in enumerate(devices):
-        if d['max_input_channels'] > 0:
+        if d["max_input_channels"] > 0:
             input_devices.append(f"{i}: {d['name']}")
     return input_devices
+
 
 def get_output_devices():
     """Returns list of available output (speaker) devices."""
     devices = sd.query_devices()
     output_devices = []
     for i, d in enumerate(devices):
-        if d['max_output_channels'] > 0:
+        if d["max_output_channels"] > 0:
             output_devices.append(f"{i}: {d['name']}")
     return output_devices
+
 
 def on_input_device_change(device_str):
     """Handle microphone device selection change."""
@@ -68,7 +77,11 @@ def on_input_device_change(device_str):
     selected_input_device = device_id
 
     # Update sounddevice default input
-    current_output = sd.default.device[1] if isinstance(sd.default.device, tuple) else sd.default.device
+    current_output = (
+        sd.default.device[1]
+        if isinstance(sd.default.device, tuple)
+        else sd.default.device
+    )
     sd.default.device = (device_id, current_output)
 
     # Restart audio monitor with new device
@@ -80,6 +93,7 @@ def on_input_device_change(device_str):
     logger.info(f"🎤 Input device changed to: {device_str}")
     return f"Input device set to: {device_str}"
 
+
 def on_output_device_change(device_str):
     """Handle speaker device selection change."""
     if not device_str:
@@ -88,11 +102,16 @@ def on_output_device_change(device_str):
     device_id = int(device_str.split(":")[0])
 
     # Update sounddevice default output
-    current_input = sd.default.device[0] if isinstance(sd.default.device, tuple) else sd.default.device
+    current_input = (
+        sd.default.device[0]
+        if isinstance(sd.default.device, tuple)
+        else sd.default.device
+    )
     sd.default.device = (current_input, device_id)
 
     logger.info(f"🔊 Output device changed to: {device_str}")
     return f"Output device set to: {device_str}"
+
 
 # =============================================================================
 # Logging Configuration
@@ -100,9 +119,9 @@ def on_output_device_change(device_str):
 logger.remove(0)
 # Use INFO level in production, DEBUG in development
 logger.add(sys.stderr, level="INFO" if IS_PROD else "DEBUG")
-conversation="""\nTranscript:\n """
-example_conversation=""" AI: Hello sir, how are you doing?
-User: Uhh good. 
+conversation = """\nTranscript:\n """
+example_conversation = """ AI: Hello sir, how are you doing?
+User: Uhh good.
 AI: Awesome, do you like the party?
 User: Can't complain
 AI: Glad to hear that! Wow, this cocktail party is… something.
@@ -110,38 +129,43 @@ User: Maybe.  """
 
 someone_talking = False
 full_send_it = False
-strikes=0
-last_voice_detected=0.0
-last_summary_time=0
-summary="\nSummary:\n"
+strikes = 0
+last_voice_detected = 0.0
+last_summary_time = 0
+summary = "\nSummary:\n"
+
 
 def talk():
     global conversation, someone_talking, last_voice_detected, summary
     logger.debug("🧠 Starting to talk...")
     text_buffer = ""
-    ai_reply="AI:"
+    ai_reply = "AI:"
     alone = all(r.startswith("AI:") for r in extract_last_replies(conversation, 2))
     is_back_and_forth = back_and_forth(conversation, 6)  # 3 back and forths
-    
+
     # Determine context to send
     if alone:
         context = "\n".join(extract_last_replies(conversation, 2))
-        #print("alone activated")
+        # print("alone activated")
     elif is_back_and_forth:
         context = "\n".join(extract_last_replies(conversation, 6))
     else:
         if not IS_PROD:
             logger.debug("summary activated")
         context = summary + conversation
-    
+
     # 1. Stream text from LLM as it's generated
-    for chunk in stream_llm_response(context, alone=alone, is_back_and_forth=is_back_and_forth):
+    for chunk in stream_llm_response(
+        context, alone=alone, is_back_and_forth=is_back_and_forth
+    ):
         text_buffer += chunk
-        ai_reply+=chunk
+        ai_reply += chunk
         if someone_talking:
             break
         # Simple heuristic: speak when we see end of sentence or buffer big enough
-        if any(p in text_buffer for p in [".", "!", "?"]) or (len(text_buffer) > 30 and text_buffer[-1]==","):
+        if any(p in text_buffer for p in [".", "!", "?"]) or (
+            len(text_buffer) > 30 and text_buffer[-1] == ","
+        ):
             speak_part = text_buffer
             text_buffer = ""
             if someone_talking:
@@ -160,14 +184,13 @@ def talk():
         return False
 
     if text_buffer:
-        ai_reply+=text_buffer
+        ai_reply += text_buffer
         logger.debug(f"🗣️ TTS on final chunk: {text_buffer!r}")
         for audio_chunk in tts_model.stream_tts_sync(text_buffer):
             if someone_talking:
                 break
             yield audio_chunk
-    conversation+="\n"+ai_reply
-
+    conversation += "\n" + ai_reply
 
 
 def echo(audio):
@@ -177,8 +200,9 @@ def echo(audio):
         yield from talk()
     transcript = stt_model.stt(audio)
     logger.debug(f"🎤 Transcript: {transcript}")
-    conversation+="\nUser:"+transcript
+    conversation += "\nUser:" + transcript
     yield from talk()
+
 
 def get_rtc_configuration():
     """Get RTC configuration for WebRTC NAT traversal."""
@@ -189,7 +213,9 @@ def get_rtc_configuration():
             # HuggingFace's free TURN server (10GB/month)
             return get_hf_turn_credentials(token=hf_token)
         except Exception as e:
-            logger.warning(f"Failed to get HF TURN credentials: {e}, using STUN fallback")
+            logger.warning(
+                f"Failed to get HF TURN credentials: {e}, using STUN fallback"
+            )
 
     # Fallback: Public STUN servers (limited NAT traversal)
     return {
@@ -202,42 +228,63 @@ def get_rtc_configuration():
 
 def create_stream():
     rtc_config = get_rtc_configuration()
-    return Stream(ReplyOnPause(echo), modality="audio", mode="send-receive", rtc_configuration=rtc_config)
+    return Stream(
+        ReplyOnPause(echo),
+        modality="audio",
+        mode="send-receive",
+        rtc_configuration=rtc_config,
+    )
 
 
 # Flag to prevent multiple talk_direct calls
 ai_is_speaking = False
 
+
 def make_summary():
     global conversation, summary
-    summary = get_llm_response(summary+conversation, summarize=True)
+    summary = get_llm_response(summary + conversation, summarize=True)
     if not IS_PROD:
         logger.debug(f"summary generated is {summary}")
     conversation = "\n".join(extract_last_replies(conversation, 10))
 
+
 def audio_callback(indata, frames, time, status):
     """Process each audio chunk as it arrives."""
-    global someone_talking, last_voice_detected, strikes, full_send_it, ai_is_speaking, conversation, last_summary_time
+    global \
+        someone_talking, \
+        last_voice_detected, \
+        strikes, \
+        full_send_it, \
+        ai_is_speaking, \
+        conversation, \
+        last_summary_time
     if status and not IS_PROD:
         logger.debug(f"Audio status: {status}")
-    
+
     audio_chunk = indata[:, 0]  # Get mono channel
     volume = np.sqrt(np.mean(audio_chunk**2))
-    #print(f"Volume: {volume:.4f}")
+    # print(f"Volume: {volume:.4f}")
     if volume >= 0.00001:
         someone_talking = True
         last_voice_detected = time_module.time()
-        #summarization during user talking to not lose active speech time. 
-        if last_summary_time==0 : #replace to 10 instead of 5
-            last_summary_time=time_module.time()
-        if time_module.time() - last_summary_time > 15 and conversation!="\nTranscript:\n ": #replace to 10 instead of 5
+        # summarization during user talking to not lose active speech time.
+        if last_summary_time == 0:  # replace to 10 instead of 5
+            last_summary_time = time_module.time()
+        if (
+            time_module.time() - last_summary_time > 15
+            and conversation != "\nTranscript:\n "
+        ):  # replace to 10 instead of 5
             last_summary_time = time_module.time()
             make_summary()
-        #strikes+=1
+        # strikes+=1
     else:
         someone_talking = False
         # Trigger proactive speech after 2 seconds of silence
-        if time_module.time() - last_voice_detected > 2 and not ai_is_speaking and conversation!="\nTranscript:\n ":
+        if (
+            time_module.time() - last_voice_detected > 2
+            and not ai_is_speaking
+            and conversation != "\nTranscript:\n "
+        ):
             ai_is_speaking = True
             # Run in separate thread to not block audio callback
             threading.Thread(target=proactive_speak, daemon=True).start()
@@ -260,10 +307,14 @@ def proactive_speak():
         ai_is_speaking = False
         last_voice_detected = time_module.time()  # Reset timer after speaking
 
+
 def start_audio_monitor(device=None):
     """Run audio monitoring in a separate thread."""
+
     def monitor_loop():
-        with sd.InputStream(samplerate=16000, channels=1, callback=audio_callback, device=device):
+        with sd.InputStream(
+            samplerate=16000, channels=1, callback=audio_callback, device=device
+        ):
             logger.info(f"🎧 Audio monitor started (device={device})...")
             while not audio_monitor_stop.is_set():
                 sd.sleep(100)  # Check stop flag every 100ms
@@ -282,11 +333,11 @@ def start_conversation_printer():
 
     def printer_loop():
         while not audio_monitor_stop.is_set():
-            logger.debug("\n" + "="*50)
+            logger.debug("\n" + "=" * 50)
             logger.debug("CONVERSATION:")
-            logger.debug("="*50)
+            logger.debug("=" * 50)
             logger.debug(conversation)
-            logger.debug("="*50 + "\n")
+            logger.debug("=" * 50 + "\n")
             time_module.sleep(5)
 
     thread = threading.Thread(target=printer_loop, daemon=True)
@@ -306,27 +357,25 @@ def create_ui_with_settings(stream):
                     choices=input_devices,
                     label="Microphone",
                     value=input_devices[0] if input_devices else None,
-                    interactive=True
+                    interactive=True,
                 )
                 speaker_dropdown = gr.Dropdown(
                     choices=output_devices,
                     label="Speaker",
                     value=output_devices[0] if output_devices else None,
-                    interactive=True
+                    interactive=True,
                 )
             with gr.Row():
                 mic_status = gr.Textbox(label="Mic Status", interactive=False)
                 speaker_status = gr.Textbox(label="Speaker Status", interactive=False)
 
             mic_dropdown.change(
-                fn=on_input_device_change,
-                inputs=[mic_dropdown],
-                outputs=[mic_status]
+                fn=on_input_device_change, inputs=[mic_dropdown], outputs=[mic_status]
             )
             speaker_dropdown.change(
                 fn=on_output_device_change,
                 inputs=[speaker_dropdown],
-                outputs=[speaker_status]
+                outputs=[speaker_status],
             )
 
         # Embed the FastRTC WebRTC stream UI
@@ -365,7 +414,12 @@ def get_ssl_config():
     ssl_certfile = os.getenv("GRADIO_SSL_CERTFILE")
     ssl_keyfile = os.getenv("GRADIO_SSL_KEYFILE")
 
-    if ssl_certfile and ssl_keyfile and os.path.exists(ssl_certfile) and os.path.exists(ssl_keyfile):
+    if (
+        ssl_certfile
+        and ssl_keyfile
+        and os.path.exists(ssl_certfile)
+        and os.path.exists(ssl_keyfile)
+    ):
         logger.info(f"SSL enabled with certificate: {ssl_certfile}")
         config = {
             "ssl_certfile": ssl_certfile,
@@ -373,7 +427,9 @@ def get_ssl_config():
         }
         # Only disable SSL verification in development mode (for self-signed certs)
         if not IS_PROD:
-            logger.warning("Development mode - SSL verification disabled (self-signed cert)")
+            logger.warning(
+                "Development mode - SSL verification disabled (self-signed cert)"
+            )
             config["ssl_verify"] = False
         return config
 
@@ -402,7 +458,9 @@ if __name__ == "__main__":
         audio_monitor_thread = start_audio_monitor()
         printer_thread = start_conversation_printer()
     else:
-        logger.info("Running in Docker mode - audio monitor disabled (WebRTC handles audio)")
+        logger.info(
+            "Running in Docker mode - audio monitor disabled (WebRTC handles audio)"
+        )
 
     stream = create_stream()
 

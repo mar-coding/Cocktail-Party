@@ -7,8 +7,10 @@ Contains all utility functions for the local voice AI agent.
 # ============================================================================
 # FUNCTIONS
 # ============================================================================
+import re
 
-#Extract everything after "Transcript:" from the conversation
+
+# Extract everything after "Transcript:" from the conversation
 def extract_transcript(text: str) -> str:
     marker = "Transcript:"
     idx = text.find(marker)
@@ -19,11 +21,8 @@ def extract_transcript(text: str) -> str:
     if line_end == -1:
         return ""
 
-    return text[line_end + 1:]
+    return text[line_end + 1 :]
 
-import re
-
-import re
 
 def extract_last_replies(text: str, n: int = 4) -> list[str]:
     # Matches lines that start with optional whitespace + optional quote + (User:|AI:)
@@ -38,7 +37,9 @@ def extract_last_replies(text: str, n: int = 4) -> list[str]:
         replies.append(f"{speaker} {content}" if content else speaker)
 
     return replies[-n:]
-def back_and_forth(transcript: str, n:int=4) -> str:
+
+
+def back_and_forth(transcript: str, n: int = 4) -> bool:
     last = extract_last_replies(transcript, n)
     if len(last) < n:
         return False
@@ -54,6 +55,7 @@ def back_and_forth(transcript: str, n:int=4) -> str:
 
     return True
 
+
 example_conversation = """
 Transcript:
 
@@ -68,4 +70,3 @@ AI: It uses a combination of natural language processing and machine learning to
 User: That sounds like a lot of work.
 AI: Yeah, it is. But it's also a lot of fun.
 """
-
