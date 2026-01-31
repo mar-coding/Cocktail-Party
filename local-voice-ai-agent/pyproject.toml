@@ -12,4 +12,5 @@ dependencies = [
     "gradio>=4.0.0",
     "sounddevice>=0.4.6",
     "numpy>=1.24.0",
+    "openai>=1.0.0",
 ]
