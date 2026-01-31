@@ -92,7 +92,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 WORKDIR /app
 
 # Copy dependency files first (layer caching)
-COPY pyproject.toml uv.lock ./
+COPY app/pyproject.toml app/uv.lock ./
 
 # Create venv and install deps; cache uv downloads across builds
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -141,7 +141,7 @@ WORKDIR /app
 COPY --from=python-builder /app/.venv /app/.venv
 
 # Copy application source
-COPY --chown=voiceai:voiceai . .
+COPY --chown=voiceai:voiceai app .
 
 # Set environment variables
 ENV PATH="/app/.venv/bin:$PATH" \

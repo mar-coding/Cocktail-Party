@@ -106,6 +106,7 @@ services:
     restart: unless-stopped
     networks:
       - cocktail-party-network
+      - web_proxy
     deploy:
       resources:
         limits:
@@ -152,7 +153,7 @@ services:
       - GRADIO_SSL_CERTFILE=/app/certs/cert.pem
       - GRADIO_SSL_KEYFILE=/app/certs/key.pem
     volumes:
-      - .:/app:ro
+      - ./app:/app:ro
       - /app/.venv  # Preserve .venv from Docker build (don't overwrite with host)
       - hf_cache:/home/voiceai/.cache/huggingface
       - kokoro_cache:/home/voiceai/.cache/kokoro
@@ -186,4 +187,4 @@ networks:
   cocktail-party-network:
     driver: bridge
   web_proxy:
-    driver: bridge
+    external: true
